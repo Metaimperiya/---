@@ -312,10 +312,27 @@ def get_post_confirm_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="❌ Отменить", callback_data="post_cancel")]
     ])
 
+def get_start_keyboard() -> InlineKeyboardMarkup:
+    """Кнопки под видео при старте - 6 штук в 3 ряда"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🚀 Главный бот", url=MAIN_BOT_URL),
+            InlineKeyboardButton(text="🌐 Наш сайт", url=SITE_URL)
+        ],
+        [
+            InlineKeyboardButton(text="📈 Бизнес-коучинг", callback_data="service_coaching"),
+            InlineKeyboardButton(text="💼 Бизнес-консалтинг", callback_data="service_consulting")
+        ],
+        [
+            InlineKeyboardButton(text="📊 Тренинги продаж", callback_data="service_sales"),
+            InlineKeyboardButton(text="📚 Курсы коучинга", callback_data="service_courses")
+        ]
+    ])
+
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-# ==================== СТАРТ С ВИДЕО ====================
+# ==================== СТАРТ С ВИДЕО И 6 КНОПКАМИ ====================
 @dp.message(CommandStart())
 async def start_cmd(message: Message, state: FSMContext):
     await state.clear()
@@ -334,20 +351,52 @@ async def start_cmd(message: Message, state: FSMContext):
         "• 📊 Тренинги по продажам\n"
         "• 📚 Курсы бизнес-коучинга\n\n"
         "💰 <b>Все цены указаны в USD</b>\n\n"
-        "👇 <b>Выберите услугу в меню ниже:</b>"
+        "👇 <b>Выберите действие ниже:</b>"
     )
     
     try:
+        # ОТПРАВЛЯЕМ ВИДЕО С 6 КНОПКАМИ ПОД НИМ
         await message.answer_video(
             video=VIDEO_URL,
             caption=welcome_text,
+            reply_markup=get_start_keyboard()
+        )
+        # И дополнительно отправляем основное меню
+        await message.answer(
+            "📋 <b>Главное меню:</b>",
             reply_markup=get_main_keyboard()
         )
     except Exception as e:
         logger.error(f"Ошибка отправки видео: {e}")
-        await message.answer(welcome_text, reply_markup=get_main_keyboard())
+        await message.answer(welcome_text, reply_markup=get_start_keyboard())
+        await message.answer("📋 <b>Главное меню:</b>", reply_markup=get_main_keyboard())
 
-# ==================== КНОПКИ ====================
+# ==================== КОЛБЭКИ ДЛЯ КНОПОК ПОД ВИДЕО ====================
+@dp.callback_query(F.data == "service_coaching")
+async def service_coaching_callback(callback: CallbackQuery):
+    await callback.answer()
+    service = SERVICES["coaching"]
+    await show_service(callback.message, service, "coaching")
+
+@dp.callback_query(F.data == "service_consulting")
+async def service_consulting_callback(callback: CallbackQuery):
+    await callback.answer()
+    service = SERVICES["consulting"]
+    await show_service(callback.message, service, "consulting")
+
+@dp.callback_query(F.data == "service_sales")
+async def service_sales_callback(callback: CallbackQuery):
+    await callback.answer()
+    service = SERVICES["sales"]
+    await show_service(callback.message, service, "sales")
+
+@dp.callback_query(F.data == "service_courses")
+async def service_courses_callback(callback: CallbackQuery):
+    await callback.answer()
+    service = SERVICES["courses"]
+    await show_service(callback.message, service, "courses")
+
+# ==================== КНОПКИ МЕНЮ ====================
 @dp.message(F.text == "📈 Бизнес-коучинг")
 async def service_coaching(message: Message):
     service = SERVICES["coaching"]
