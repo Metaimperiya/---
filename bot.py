@@ -15,10 +15,7 @@ from aiogram.types import (
     InlineKeyboardMarkup, 
     InlineKeyboardButton, 
     CallbackQuery,
-    TelegramObject,
-    ChatMemberUpdated,
-    ChatJoinRequest,
-    FSInputFile
+    TelegramObject
 )
 from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -325,9 +322,8 @@ async def start_cmd(message: Message, state: FSMContext):
     await db.save_action(message.from_user.id, "start", "Запуск бота")
     await notify_admin_about_action("🚀 Запуск бота", message.from_user)
     
-    # ВИДЕО ДЛЯ ПРИВЕТСТВИЯ (вставь свой file_id или ссылку)
-    # Чтобы получить file_id: отправь видео боту, он напишет в логах
-    VIDEO_ID = "BAACAgIAAxkBAA...ВСТАВЬ_СЮДА_ID_ВИДЕО"  # Замени на свой!
+    # ТВОЕ ВИДЕО С GITHUB
+    VIDEO_URL = "https://raw.githubusercontent.com/Metaimperiya/---/main/videos/METAIMPERIY%20(1).mp4"
     
     welcome_text = (
         f"👋 <b>Салам, {message.from_user.first_name}!</b>\n\n"
@@ -342,14 +338,13 @@ async def start_cmd(message: Message, state: FSMContext):
     )
     
     try:
-        # Отправляем ВИДЕО вместо фото
         await message.answer_video(
-            video=VIDEO_ID,
+            video=VIDEO_URL,
             caption=welcome_text,
             reply_markup=get_main_keyboard()
         )
-    except:
-        # Если видео не найдено - отправляем текст
+    except Exception as e:
+        logger.error(f"Ошибка отправки видео: {e}")
         await message.answer(welcome_text, reply_markup=get_main_keyboard())
 
 # ==================== КНОПКИ ====================
