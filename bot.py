@@ -1,6 +1,7 @@
 import asyncio
 import os
 import logging
+import json
 from datetime import datetime
 from typing import Optional, Set, Dict, Any, List, Union
 
@@ -14,19 +15,17 @@ from aiogram.types import (
     InlineKeyboardMarkup, 
     InlineKeyboardButton, 
     CallbackQuery,
-    WebAppInfo,
     TelegramObject,
     ChatMemberUpdated,
     ChatJoinRequest
 )
-from aiogram.filters import CommandStart, Command, StateFilter, ChatMemberUpdatedFilter, IS_NOT_MEMBER, IS_MEMBER
+from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
-from aiogram.exceptions import TelegramForbiddenError, TelegramAPIError
+from aiogram.exceptions import TelegramAPIError
 
 # ==================== ЛОГИРОВАНИЕ ====================
 logging.basicConfig(
@@ -44,9 +43,8 @@ CHANNEL_ID = os.getenv("CHANNEL_ID", "@zakazat_sayt_dlya_shkoly")
 GROUP_ID = os.getenv("GROUP_ID", "@zakazatsaytdlyashkoly")
 SITE_URL = os.getenv("SITE_URL", "https://www.metaimperiya.com/")
 
-# !!! ВАЖНО: тут твой основной бот и твой профиль для уведомлений
 MAIN_BOT_URL = "https://t.me/Biznes_kursy_bot"
-ADMIN_USERNAME = "@METAIMPERIYA"  # Твой профиль для уведомлений
+ADMIN_USERNAME = "@METAIMPERIYA"
 
 ADMIN_IDS: Set[int] = set()
 raw_admin_ids = os.getenv("ADMIN_ID", "")
@@ -113,6 +111,9 @@ class Database:
                     admin_id INTEGER,
                     text TEXT,
                     photo_id TEXT,
+                    video_id TEXT,
+                    media_type TEXT,
+                    buttons TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -157,10 +158,16 @@ class Database:
         await self._conn.commit()
         return cursor.lastrowid
 
-    async def save_post(self, admin_id: int, text: str, photo_id: Optional[str] = None) -> int:
+    async def save_post_full(self, admin_id: int, text: str, media_type: str = "text", 
+                             media_id: Optional[str] = None, buttons: Optional[List] = None) -> int:
+        buttons_json = json.dumps(buttons) if buttons else None
         cursor = await self._conn.execute(
-            "INSERT INTO posts (admin_id, text, photo_id) VALUES (?, ?, ?)",
-            (admin_id, text, photo_id)
+            """INSERT INTO posts (admin_id, text, photo_id, video_id, media_type, buttons) 
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (admin_id, text, 
+             media_id if media_type == "photo" else None,
+             media_id if media_type == "video" else None,
+             media_type, buttons_json)
         )
         await self._conn.commit()
         return cursor.lastrowid
@@ -170,6 +177,25 @@ class Database:
             "INSERT INTO user_actions (telegram_id, action_type, action_data) VALUES (?, ?, ?)",
             (telegram_id, action_type, action_data[:200])
         )
+        await self._conn.commit()
+    
+    async def get_posts(self, limit: int = 10) -> List[Dict]:
+        async with self._conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT * FROM posts ORDER BY created_at DESC LIMIT ?",
+                (limit,)
+            )
+            rows = await cursor.fetchall()
+            posts = []
+            for row in rows:
+                post = dict(row)
+                if post.get('buttons'):
+                    post['buttons'] = json.loads(post['buttons'])
+                posts.append(post)
+            return posts
+    
+    async def delete_post(self, post_id: int):
+        await self._conn.execute("DELETE FROM posts WHERE id = ?", (post_id,))
         await self._conn.commit()
 
 db = Database()
@@ -186,20 +212,14 @@ class UserTrackingMiddleware(BaseMiddleware):
                     first_name=user.first_name or "",
                     last_name=user.last_name or "",
                 )
-                
-                # Отправляем уведомление о новом пользователе
                 await notify_admin_about_user(user)
-                
             except Exception as e:
                 logger.error(f"Ошибка сохранения пользователя: {e}")
         return await handler(event, data)
 
 # ==================== УВЕДОМЛЕНИЯ АДМИНУ ====================
 async def notify_admin_about_user(user) -> bool:
-    """Отправляет уведомление админу о новом пользователе"""
     try:
-        # Пытаемся отправить уведомление в личку @METAIMPERIYA
-        # Для этого нужно знать ID, но мы отправим через юзернейм
         notification_text = (
             "🔔 <b>НОВЫЙ ПОЛЬЗОВАТЕЛЬ!</b>\n\n"
             f"👤 <b>Имя:</b> {user.first_name}\n"
@@ -209,24 +229,14 @@ async def notify_admin_about_user(user) -> bool:
             f"🌐 <a href='{SITE_URL}'>На сайт</a> | <a href='{MAIN_BOT_URL}'>Главный бот</a>"
         )
         
-        # Отправляем админам из списка
         for admin_id in ADMIN_IDS:
             try:
-                await bot.send_message(
-                    chat_id=admin_id,
-                    text=notification_text,
-                    parse_mode=ParseMode.HTML
-                )
+                await bot.send_message(chat_id=admin_id, text=notification_text, parse_mode=ParseMode.HTML)
             except Exception as e:
                 logger.error(f"Не удалось отправить админу {admin_id}: {e}")
         
-        # Также пытаемся отправить через юзернейм (если есть в контактах)
         try:
-            await bot.send_message(
-                chat_id=ADMIN_USERNAME,
-                text=notification_text,
-                parse_mode=ParseMode.HTML
-            )
+            await bot.send_message(chat_id=ADMIN_USERNAME, text=notification_text, parse_mode=ParseMode.HTML)
         except Exception as e:
             logger.error(f"Не удалось отправить @{ADMIN_USERNAME}: {e}")
             
@@ -236,7 +246,6 @@ async def notify_admin_about_user(user) -> bool:
         return False
 
 async def notify_admin_about_action(action_type: str, user, extra_data: str = ""):
-    """Уведомление о любом действии пользователя"""
     try:
         notification_text = (
             f"📊 <b>ДЕЙСТВИЕ ПОЛЬЗОВАТЕЛЯ</b>\n\n"
@@ -254,20 +263,12 @@ async def notify_admin_about_action(action_type: str, user, extra_data: str = ""
         
         for admin_id in ADMIN_IDS:
             try:
-                await bot.send_message(
-                    chat_id=admin_id,
-                    text=notification_text,
-                    parse_mode=ParseMode.HTML
-                )
+                await bot.send_message(chat_id=admin_id, text=notification_text, parse_mode=ParseMode.HTML)
             except Exception as e:
                 logger.error(f"Не удалось отправить админу {admin_id}: {e}")
                 
         try:
-            await bot.send_message(
-                chat_id=ADMIN_USERNAME,
-                text=notification_text,
-                parse_mode=ParseMode.HTML
-            )
+            await bot.send_message(chat_id=ADMIN_USERNAME, text=notification_text, parse_mode=ParseMode.HTML)
         except Exception as e:
             logger.error(f"Не удалось отправить @{ADMIN_USERNAME}: {e}")
             
@@ -282,7 +283,7 @@ bot = Bot(
 dp = Dispatcher(storage=MemoryStorage())
 dp.update.outer_middleware(UserTrackingMiddleware())
 
-# ==================== ДАННЫЕ УСЛУГ (В ДОЛЛАРАХ) ====================
+# ==================== ДАННЫЕ УСЛУГ ====================
 SERVICES = {
     "album": {
         "emoji": "🎓",
@@ -321,6 +322,12 @@ class PostStates(StatesGroup):
     waiting_for_buttons = State()
     waiting_for_confirmation = State()
 
+class AdminPostStates(StatesGroup):
+    waiting_for_media = State()
+    waiting_for_text = State()
+    waiting_for_buttons = State()
+    waiting_for_confirmation = State()
+
 class OrderStates(StatesGroup):
     service = State()
     name = State()
@@ -329,7 +336,6 @@ class OrderStates(StatesGroup):
 
 # ==================== КЛАВИАТУРЫ ====================
 def get_main_keyboard() -> ReplyKeyboardMarkup:
-    """Главное меню со ВСЕМИ ссылками"""
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🎓 Выпускной альбом / Класс")],
@@ -353,12 +359,11 @@ def get_post_confirm_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Опубликовать", callback_data="post_publish")],
         [InlineKeyboardButton(text="✏️ Редактировать текст", callback_data="post_edit_text")],
-        [InlineKeyboardButton(text="🔄 Изменить фото", callback_data="post_edit_photo")],
+        [InlineKeyboardButton(text="🔄 Изменить медиа", callback_data="post_edit_photo")],
         [InlineKeyboardButton(text="❌ Отменить", callback_data="post_cancel")]
     ])
 
 def get_channel_menu() -> InlineKeyboardMarkup:
-    """Меню для каналов и групп - со ВСЕМИ ссылками"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="🚀 Главный бот", url=MAIN_BOT_URL),
@@ -378,16 +383,7 @@ def get_channel_menu() -> InlineKeyboardMarkup:
         ]
     ])
 
-def get_site_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура с сайтом и ботом"""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🌐 Перейти на сайт", url=SITE_URL)],
-        [InlineKeyboardButton(text="🤖 Главный бот", url=MAIN_BOT_URL)],
-        [InlineKeyboardButton(text="📢 Наши каналы", callback_data="show_channels")]
-    ])
-
 def get_all_links_keyboard() -> InlineKeyboardMarkup:
-    """Все ссылки в одной клавиатуре"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="🚀 Главный бот", url=MAIN_BOT_URL),
@@ -406,16 +402,11 @@ def get_all_links_keyboard() -> InlineKeyboardMarkup:
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-# ==================== ПРИВЕТСТВИЕ С КНОПКАМИ ====================
+# ==================== ПРИВЕТСТВИЕ ====================
 @dp.message(CommandStart())
 async def start_cmd(message: Message, state: FSMContext):
-    """Стартовая команда со всеми ссылками"""
     await state.clear()
-    
-    # Сохраняем действие
     await db.save_action(message.from_user.id, "start", "Запуск бота")
-    
-    # Уведомляем админа
     await notify_admin_about_action("🚀 Запуск бота", message.from_user)
     
     welcome_keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -453,34 +444,18 @@ async def start_cmd(message: Message, state: FSMContext):
     ).format(MAIN_BOT_URL, SITE_URL)
     
     await message.answer(welcome_text, reply_markup=welcome_keyboard)
-    await message.answer(
-        "Или выберите услугу в меню ниже:",
-        reply_markup=get_main_keyboard()
-    )
+    await message.answer("Или выберите услугу в меню ниже:", reply_markup=get_main_keyboard())
 
-# ==================== ОБРАБОТКА ВХОДА В КАНАЛ/ГРУППУ ====================
+# ==================== ВХОД В КАНАЛ/ГРУППУ ====================
 @dp.chat_member()
 async def chat_member_update(event: ChatMemberUpdated):
-    """Отслеживаем, когда пользователь заходит в канал/группу"""
     if event.new_chat_member.status == "member":
         user = event.from_user
         chat = event.chat
         
-        # Сохраняем действие
-        await db.save_action(
-            user.id, 
-            "join_chat", 
-            f"Вступил в {chat.title} ({chat.id})"
-        )
+        await db.save_action(user.id, "join_chat", f"Вступил в {chat.title} ({chat.id})")
+        await notify_admin_about_action(f"➕ Вступил в канал/группу: {chat.title}", user, f"Чат ID: {chat.id}")
         
-        # Уведомляем админа
-        await notify_admin_about_action(
-            f"➕ Вступил в канал/группу: {chat.title}", 
-            user,
-            f"Чат ID: {chat.id}"
-        )
-        
-        # Отправляем приветствие с меню
         try:
             welcome_text = (
                 f"👋 <b>Добро пожаловать, {user.first_name}!</b>\n\n"
@@ -494,39 +469,20 @@ async def chat_member_update(event: ChatMemberUpdated):
                 "• <a href='https://t.me/kursy_biznes_kouchinga'>Курсы коучинга</a>"
             ).format(MAIN_BOT_URL, SITE_URL)
             
-            await bot.send_message(
-                chat_id=user.id,
-                text=welcome_text,
-                reply_markup=get_channel_menu()
-            )
+            await bot.send_message(chat_id=user.id, text=welcome_text, reply_markup=get_channel_menu())
         except Exception as e:
             logger.error(f"Не удалось отправить приветствие пользователю {user.id}: {e}")
 
-# ==================== ОБРАБОТКА ЗАЯВОК НА ВСТУПЛЕНИЕ ====================
 @dp.chat_join_request()
 async def handle_join_request(event: ChatJoinRequest):
-    """Обработка заявок на вступление в закрытые каналы"""
     user = event.from_user
     chat = event.chat
     
-    # Автоматически одобряем заявку
     try:
         await event.approve()
+        await db.save_action(user.id, "join_request_approved", f"Одобрена заявка в {chat.title}")
+        await notify_admin_about_action(f"✅ Одобрена заявка в {chat.title}", user)
         
-        # Сохраняем действие
-        await db.save_action(
-            user.id,
-            "join_request_approved",
-            f"Одобрена заявка в {chat.title}"
-        )
-        
-        # Уведомляем админа
-        await notify_admin_about_action(
-            f"✅ Одобрена заявка в {chat.title}",
-            user
-        )
-        
-        # Отправляем приветствие
         welcome_text = (
             f"👋 <b>Добро пожаловать, {user.first_name}!</b>\n\n"
             "🎯 <b>Наши ресурсы:</b>\n"
@@ -539,22 +495,14 @@ async def handle_join_request(event: ChatJoinRequest):
             "• <a href='https://t.me/kursy_biznes_kouchinga'>Курсы коучинга</a>"
         ).format(MAIN_BOT_URL, SITE_URL)
         
-        await bot.send_message(
-            chat_id=user.id,
-            text=welcome_text,
-            reply_markup=get_channel_menu()
-        )
-        
+        await bot.send_message(chat_id=user.id, text=welcome_text, reply_markup=get_channel_menu())
     except Exception as e:
         logger.error(f"Ошибка обработки заявки: {e}")
 
-# ==================== CALLBACK ДЛЯ ПРИВЕТСТВИЯ ====================
+# ==================== CALLBACK'И ====================
 @dp.callback_query(F.data == "call_request")
 async def call_request(callback: CallbackQuery):
-    """Заказ звонка"""
     await callback.answer()
-    
-    # Сохраняем действие
     await db.save_action(callback.from_user.id, "call_request", "Запрос звонка")
     await notify_admin_about_action("📞 Запрос звонка", callback.from_user)
     
@@ -572,7 +520,6 @@ async def call_request(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "show_channels")
 async def show_channels(callback: CallbackQuery):
-    """Показать все каналы"""
     await callback.answer()
     
     await callback.message.answer(
@@ -594,7 +541,6 @@ async def show_channels(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "order_from_channel")
 async def order_from_channel(callback: CallbackQuery, state: FSMContext):
-    """Заказ из канала"""
     await callback.answer()
     await callback.message.answer(
         "📝 <b>Оформление заявки</b>\n\n"
@@ -605,9 +551,7 @@ async def order_from_channel(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "show_portfolio")
 async def show_portfolio(callback: CallbackQuery):
-    """Показать портфолио"""
     await callback.answer()
-    
     await db.save_action(callback.from_user.id, "view_portfolio", "Просмотр портфолио")
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -628,9 +572,7 @@ async def show_portfolio(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "faq")
 async def faq(callback: CallbackQuery):
-    """Частые вопросы"""
     await callback.answer()
-    
     await db.save_action(callback.from_user.id, "faq", "Просмотр FAQ")
     
     faq_text = (
@@ -655,59 +597,99 @@ async def faq(callback: CallbackQuery):
     
     await callback.message.answer(faq_text, reply_markup=keyboard)
 
-# ==================== ПУБЛИКАЦИЯ В КАНАЛ (POST MAKER) ====================
-@dp.message(Command("post"))
-async def start_post_creation(message: Message, state: FSMContext):
+# ==================== АДМИН-ПАНЕЛЬ ====================
+@dp.message(Command("admin"))
+async def admin_panel(message: Message):
     if not is_admin(message.from_user.id):
         await message.answer("⛔ Доступ запрещен!")
         return
-
-    await state.set_state(PostStates.waiting_for_photo)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Создать пост", callback_data="admin_create_post")],
+        [InlineKeyboardButton(text="📋 Мои посты", callback_data="admin_my_posts")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="📋 Заявки", callback_data="admin_orders")],
+        [InlineKeyboardButton(text="🔔 Тест уведомления", callback_data="admin_test_notify")]
+    ])
+    
     await message.answer(
-        "📝 <b>Создание поста для канала</b>\n\n"
-        "Отправьте <b>фотографию</b> или нажмите /skip\n"
+        "🛠 <b>Админ-панель</b>\n\n"
+        f"📢 Канал: {CHANNEL_ID}\n"
+        f"💬 Группа: {GROUP_ID}\n"
+        f"💰 Валюта: USD\n"
+        f"🤖 Главный бот: {MAIN_BOT_URL}\n"
+        f"🌐 Сайт: {SITE_URL}",
+        reply_markup=keyboard
+    )
+
+# ==================== СОЗДАНИЕ ПОСТОВ (АДМИНКА) ====================
+@dp.callback_query(F.data == "admin_create_post")
+async def admin_create_post(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    if not is_admin(callback.from_user.id):
+        return
+    
+    await state.set_state(AdminPostStates.waiting_for_media)
+    await callback.message.answer(
+        "📝 <b>Создание поста</b>\n\n"
+        "Отправьте <b>фото</b> (JPG/PNG) или <b>видео</b> (MP4)\n"
+        "Или нажмите /skip - для текстового поста\n\n"
         "🔄 /cancel - отмена"
     )
 
-@dp.message(Command("cancel"), StateFilter(PostStates))
-async def cancel_post(message: Message, state: FSMContext):
+@dp.message(Command("cancel"), StateFilter(AdminPostStates))
+async def cancel_post_admin(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("❌ Создание поста отменено.", reply_markup=get_main_keyboard())
 
-@dp.message(Command("skip"), PostStates.waiting_for_photo)
-async def skip_photo(message: Message, state: FSMContext):
-    await state.update_data(photo=None)
-    await state.set_state(PostStates.waiting_for_text)
+@dp.message(Command("skip"), AdminPostStates.waiting_for_media)
+async def skip_media_admin(message: Message, state: FSMContext):
+    await state.update_data(media_type="text", media_id=None)
+    await state.set_state(AdminPostStates.waiting_for_text)
     await message.answer("✏️ Введите <b>текст поста</b> (поддерживается HTML):")
 
-@dp.message(PostStates.waiting_for_photo, F.photo)
-async def process_photo(message: Message, state: FSMContext):
+@dp.message(AdminPostStates.waiting_for_media, F.photo)
+async def process_photo_admin(message: Message, state: FSMContext):
     photo_id = message.photo[-1].file_id
-    await state.update_data(photo=photo_id)
-    await state.set_state(PostStates.waiting_for_text)
+    await state.update_data(media_type="photo", media_id=photo_id)
+    await state.set_state(AdminPostStates.waiting_for_text)
     await message.answer("✅ Фото принято! Теперь введите <b>текст поста</b>:")
 
-@dp.message(PostStates.waiting_for_text)
-async def process_text(message: Message, state: FSMContext):
+@dp.message(AdminPostStates.waiting_for_media, F.video)
+async def process_video_admin(message: Message, state: FSMContext):
+    video_id = message.video.file_id
+    await state.update_data(media_type="video", media_id=video_id)
+    await state.set_state(AdminPostStates.waiting_for_text)
+    await message.answer("✅ Видео принято! Теперь введите <b>текст поста</b>:")
+
+@dp.message(AdminPostStates.waiting_for_media)
+async def process_media_unknown_admin(message: Message, state: FSMContext):
+    await message.answer(
+        "❌ Отправьте <b>фото</b> или <b>видео</b>\n"
+        "Или нажмите /skip для текстового поста"
+    )
+
+@dp.message(AdminPostStates.waiting_for_text)
+async def process_text_admin(message: Message, state: FSMContext):
     await state.update_data(text=message.text)
-    await state.set_state(PostStates.waiting_for_buttons)
+    await state.set_state(AdminPostStates.waiting_for_buttons)
     
-    example = (
+    await message.answer(
         "🔘 <b>Добавьте кнопки</b>\n\n"
         "Формат: <code>Текст - https://ссылка.com</code>\n"
         "Пример:\n"
         "<code>Заказать - https://t.me/Biznes_kursy_bot</code>\n"
+        "<code>На сайт - https://www.metaimperiya.com/</code>\n\n"
         "📌 /skip - если кнопки не нужны"
     )
-    await message.answer(example)
 
-@dp.message(Command("skip"), PostStates.waiting_for_buttons)
-async def skip_buttons(message: Message, state: FSMContext):
+@dp.message(Command("skip"), AdminPostStates.waiting_for_buttons)
+async def skip_buttons_admin(message: Message, state: FSMContext):
     await state.update_data(buttons=[])
-    await show_post_preview(message, state)
+    await show_post_preview_admin(message, state)
 
-@dp.message(PostStates.waiting_for_buttons)
-async def process_buttons(message: Message, state: FSMContext):
+@dp.message(AdminPostStates.waiting_for_buttons)
+async def process_buttons_admin(message: Message, state: FSMContext):
     lines = message.text.strip().split("\n")
     buttons = []
     
@@ -725,12 +707,13 @@ async def process_buttons(message: Message, state: FSMContext):
         return
     
     await state.update_data(buttons=buttons)
-    await show_post_preview(message, state)
+    await show_post_preview_admin(message, state)
 
-async def show_post_preview(message: Message, state: FSMContext):
+async def show_post_preview_admin(message: Message, state: FSMContext):
     data = await state.get_data()
     text = data.get("text", "")
-    photo = data.get("photo")
+    media_type = data.get("media_type", "text")
+    media_id = data.get("media_id")
     buttons = data.get("buttons", [])
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
@@ -738,28 +721,34 @@ async def show_post_preview(message: Message, state: FSMContext):
     preview_text = (
         "📋 <b>Превью поста</b>\n\n"
         f"📝 {text[:300]}{'...' if len(text) > 300 else ''}\n\n"
-        f"🖼 Фото: {'✅' if photo else '❌'}\n"
+        f"🖼 Медиа: {'✅ ' + media_type if media_id else '❌'}\n"
         f"🔘 Кнопки: {len(buttons)} шт.\n\n"
         "👇 Нажмите 'Опубликовать'"
     )
     
     try:
-        if photo:
+        if media_type == "photo" and media_id:
             await message.answer_photo(
-                photo=photo,
+                photo=media_id,
+                caption=preview_text,
+                reply_markup=get_post_confirm_keyboard()
+            )
+        elif media_type == "video" and media_id:
+            await message.answer_video(
+                video=media_id,
                 caption=preview_text,
                 reply_markup=get_post_confirm_keyboard()
             )
         else:
             await message.answer(preview_text, reply_markup=get_post_confirm_keyboard())
         
-        await state.set_state(PostStates.waiting_for_confirmation)
+        await state.set_state(AdminPostStates.waiting_for_confirmation)
     except Exception as e:
         logger.error(f"Ошибка: {e}")
         await message.answer(f"❌ Ошибка: {e}")
 
-@dp.callback_query(F.data == "post_publish", PostStates.waiting_for_confirmation)
-async def publish_post(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data == "post_publish", AdminPostStates.waiting_for_confirmation)
+async def publish_post_admin(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     
     if not is_admin(callback.from_user.id):
@@ -768,18 +757,27 @@ async def publish_post(callback: CallbackQuery, state: FSMContext):
     
     data = await state.get_data()
     text = data.get("text", "")
-    photo = data.get("photo")
+    media_type = data.get("media_type", "text")
+    media_id = data.get("media_id")
     buttons = data.get("buttons", [])
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
     
     try:
-        if photo:
-            await bot.send_photo(chat_id=CHANNEL_ID, photo=photo, caption=text, reply_markup=keyboard)
+        if media_type == "photo" and media_id:
+            await bot.send_photo(chat_id=CHANNEL_ID, photo=media_id, caption=text, reply_markup=keyboard)
+        elif media_type == "video" and media_id:
+            await bot.send_video(chat_id=CHANNEL_ID, video=media_id, caption=text, reply_markup=keyboard)
         else:
             await bot.send_message(chat_id=CHANNEL_ID, text=text, reply_markup=keyboard)
         
-        await db.save_post(admin_id=callback.from_user.id, text=text, photo_id=photo)
+        await db.save_post_full(
+            admin_id=callback.from_user.id,
+            text=text,
+            media_type=media_type,
+            media_id=media_id,
+            buttons=buttons
+        )
         
         await bot.send_message(
             chat_id=GROUP_ID,
@@ -791,27 +789,97 @@ async def publish_post(callback: CallbackQuery, state: FSMContext):
         
         await callback.message.answer(f"✅ <b>Пост опубликован!</b>\n📢 {CHANNEL_ID}")
         await state.clear()
+        
     except Exception as e:
         logger.error(f"Ошибка: {e}")
-        await callback.message.answer(f"❌ Ошибка: {e}")
+        await callback.message.answer(f"❌ Ошибка публикации: {e}")
 
-@dp.callback_query(F.data == "post_edit_text", PostStates.waiting_for_confirmation)
-async def edit_post_text(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data == "post_edit_text", AdminPostStates.waiting_for_confirmation)
+async def edit_post_text_admin(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    await state.set_state(PostStates.waiting_for_text)
+    await state.set_state(AdminPostStates.waiting_for_text)
     await callback.message.answer("✏️ Введите новый текст:")
 
-@dp.callback_query(F.data == "post_edit_photo", PostStates.waiting_for_confirmation)
-async def edit_post_photo(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data == "post_edit_photo", AdminPostStates.waiting_for_confirmation)
+async def edit_post_media_admin(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    await state.set_state(PostStates.waiting_for_photo)
-    await callback.message.answer("📸 Отправьте новое фото или /skip:")
+    await state.set_state(AdminPostStates.waiting_for_media)
+    await callback.message.answer("📸 Отправьте новое фото/видео или /skip:")
 
-@dp.callback_query(F.data == "post_cancel", PostStates.waiting_for_confirmation)
-async def cancel_publish(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data == "post_cancel", AdminPostStates.waiting_for_confirmation)
+async def cancel_publish_admin(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.clear()
     await callback.message.answer("❌ Отменено.", reply_markup=get_main_keyboard())
+
+# ==================== МОИ ПОСТЫ ====================
+@dp.callback_query(F.data == "admin_my_posts")
+async def admin_my_posts(callback: CallbackQuery):
+    await callback.answer()
+    if not is_admin(callback.from_user.id):
+        return
+    
+    posts = await db.get_posts(limit=10)
+    
+    if not posts:
+        await callback.message.answer("📭 Пока нет постов.")
+        return
+    
+    text = "📋 <b>Последние посты:</b>\n\n"
+    
+    for post in posts:
+        post_id = post['id']
+        date = post['created_at'][:10] if post['created_at'] else "дата неизвестна"
+        media_icon = "🎬" if post['media_type'] == "video" else ("🖼" if post['media_type'] == "photo" else "📝")
+        text += f"{media_icon} Пост #{post_id} | {date}\n"
+    
+    text += "\n🔜 Скоро: просмотр и удаление постов"
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")]
+    ])
+    
+    await callback.message.answer(text, reply_markup=keyboard)
+
+@dp.callback_query(F.data == "admin_back")
+async def admin_back(callback: CallbackQuery):
+    await callback.answer()
+    await admin_panel(callback.message)
+
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats(callback: CallbackQuery):
+    await callback.answer()
+    if not is_admin(callback.from_user.id):
+        return
+    
+    await callback.message.answer(
+        "📊 <b>Статистика</b>\n\n"
+        "Данные загружаются из БД..."
+    )
+
+@dp.callback_query(F.data == "admin_orders")
+async def admin_orders(callback: CallbackQuery):
+    await callback.answer()
+    if not is_admin(callback.from_user.id):
+        return
+    
+    await callback.message.answer(
+        "📋 <b>Последние заявки</b>\n\n"
+        "Данные загружаются из БД..."
+    )
+
+@dp.callback_query(F.data == "admin_test_notify")
+async def admin_test_notify(callback: CallbackQuery):
+    await callback.answer()
+    if not is_admin(callback.from_user.id):
+        return
+    
+    await notify_admin_about_action(
+        "🧪 Тестовое уведомление",
+        callback.from_user,
+        "Это тестовое сообщение от бота"
+    )
+    await callback.message.answer("✅ Тестовое уведомление отправлено!")
 
 # ==================== ОФОРМЛЕНИЕ ЗАЯВОК ====================
 @dp.message(F.text == "📞 Заявка")
@@ -872,14 +940,12 @@ async def finish_order(message: Message, state: FSMContext):
         )
         logger.info(f"✅ Заявка #{order_id} создана")
         
-        # Сохраняем действие
         await db.save_action(
             message.from_user.id,
             "order_created",
             f"Заявка #{order_id}: {data.get('service', '')}"
         )
         
-        # Уведомляем админа
         await notify_admin_about_action(
             f"📝 Новая заявка #{order_id}",
             message.from_user,
@@ -941,7 +1007,6 @@ async def show_service_card(message: Message):
     
     service = SERVICES[service_key]
     
-    # Сохраняем действие
     await db.save_action(
         message.from_user.id,
         "view_service",
@@ -1004,74 +1069,6 @@ async def contact_manager(callback: CallbackQuery):
         "📞 <b>Связаться с менеджером</b>\n\nНапишите нам в главном боте!",
         reply_markup=keyboard
     )
-
-# ==================== АДМИН-КОМАНДЫ ====================
-@dp.message(Command("admin"))
-async def admin_panel(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("⛔ Доступ запрещен!")
-        return
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📝 Создать пост", callback_data="admin_post")],
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
-        [InlineKeyboardButton(text="📋 Заявки", callback_data="admin_orders")],
-        [InlineKeyboardButton(text="🔔 Тест уведомления", callback_data="admin_test_notify")]
-    ])
-    
-    await message.answer(
-        "🛠 <b>Админ-панель</b>\n\n"
-        f"📢 Канал: {CHANNEL_ID}\n"
-        f"💬 Группа: {GROUP_ID}\n"
-        f"💰 Валюта: USD\n"
-        f"🤖 Главный бот: {MAIN_BOT_URL}\n"
-        f"🌐 Сайт: {SITE_URL}",
-        reply_markup=keyboard
-    )
-
-@dp.callback_query(F.data == "admin_post")
-async def admin_post_callback(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    await start_post_creation(callback.message, state)
-
-@dp.callback_query(F.data == "admin_stats")
-async def admin_stats(callback: CallbackQuery):
-    await callback.answer()
-    if not is_admin(callback.from_user.id):
-        return
-    
-    await callback.message.answer(
-        "📊 <b>Статистика</b>\n\n"
-        "Данные загружаются из БД..."
-    )
-
-@dp.callback_query(F.data == "admin_orders")
-async def admin_orders(callback: CallbackQuery):
-    await callback.answer()
-    if not is_admin(callback.from_user.id):
-        return
-    
-    await callback.message.answer(
-        "📋 <b>Последние заявки</b>\n\n"
-        "Данные загружаются из БД..."
-    )
-
-@dp.callback_query(F.data == "admin_test_notify")
-async def admin_test_notify(callback: CallbackQuery):
-    await callback.answer()
-    if not is_admin(callback.from_user.id):
-        return
-    
-    success = await notify_admin_about_action(
-        "🧪 Тестовое уведомление",
-        callback.from_user,
-        "Это тестовое сообщение от бота"
-    )
-    
-    if success:
-        await callback.message.answer("✅ Тестовое уведомление отправлено!")
-    else:
-        await callback.message.answer("❌ Ошибка отправки уведомления")
 
 # ==================== ВЕБ-СЕРВЕР ====================
 class WebServer:
