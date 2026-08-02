@@ -37,12 +37,12 @@ TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise ValueError("❌ BOT_TOKEN не установлен!")
 
-CHANNEL_ID = os.getenv("CHANNEL_ID", "@zakazat_sayt_dlya_shkoly")
-GROUP_ID = os.getenv("GROUP_ID", "@zakazatsaytdlyashkoly")
+CHANNEL_ID = os.getenv("CHANNEL_ID", "@Biznes_kouching")
+GROUP_ID = os.getenv("GROUP_ID", "806159173")
 SITE_URL = os.getenv("SITE_URL", "https://www.metaimperiya.com/")
 
 ADMIN_IDS: Set[int] = set()
-raw_admin_ids = os.getenv("ADMIN_ID", "")
+raw_admin_ids = os.getenv("ADMIN_ID", "806159173")
 if raw_admin_ids:
     for part in raw_admin_ids.split(","):
         part = part.strip()
@@ -92,15 +92,6 @@ class Database:
                     username TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     status TEXT DEFAULT 'new'
-                )
-            """)
-            await cursor.execute("""
-                CREATE TABLE IF NOT EXISTS posts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    admin_id INTEGER,
-                    text TEXT,
-                    photo_id TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             await self._conn.commit()
@@ -186,18 +177,12 @@ SERVICES = {
         "emoji": "📈",
         "name": "Курс «Бизнес-Масштаб 2.0»",
         "price": "от $290",
-        "description": "• Онлайн-курс с предописанными видео-уроками\n• Шаблоны, таблицы финансового учета и регламенты\n• Сертификат о прохождении + чат поддержки",
+        "description": "• Онлайн-курс с видео-уроками\n• Шаблоны, таблицы финансового учета и регламенты\n• Сертификат о прохождении + чат поддержки",
         "photo": "https://images.unsplash.com/photo-1460925895917-afdab827c52f?auto=format&fit=crop&w=800&q=80",
     }
 }
 
 # ==================== СОСТОЯНИЯ FSM ====================
-class PostStates(StatesGroup):
-    waiting_for_photo = State()
-    waiting_for_text = State()
-    waiting_for_buttons = State()
-    waiting_for_confirmation = State()
-
 class OrderStates(StatesGroup):
     service = State()
     name = State()
@@ -225,31 +210,27 @@ def get_cancel_keyboard() -> ReplyKeyboardMarkup:
         resize_keyboard=True
     )
 
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
 # ==================== ПРИВЕТСТВИЕ С КНОПКАМИ ====================
 @dp.message(CommandStart())
 async def start_cmd(message: Message, state: FSMContext):
-    """Стартовая команда с богатым блоком кнопок"""
     await state.clear()
     
     welcome_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="🌐 Официальный сайт", url=SITE_URL),
-            InlineKeyboardButton(text="📢 Наш Telegram-канал", url=f"https://t.me/{CHANNEL_ID.replace('@', '')}")
+            InlineKeyboardButton(text="📢 Бизнес Коучинг", url="https://t.me/Biznes_kouching")
         ],
         [
-            InlineKeyboardButton(text="🎓 Обо мне / Кейсы", callback_data="about_coach"),
-            InlineKeyboardButton(text="🎯 Бесплатный гайд", callback_data="free_guide")
+            InlineKeyboardButton(text="💼 Бизнес Консультант", url="https://t.me/Bizneskonsultant"),
+            InlineKeyboardButton(text="🎯 Тренинги по продажам", url="https://t.me/Treningi_po_prodazham")
         ],
         [
-            InlineKeyboardButton(text="💬 Связаться лично", url="https://t.me/metaimperiya_support"),
-            InlineKeyboardButton(text="📞 Заказать обратный звонок", callback_data="call_request")
+            InlineKeyboardButton(text="📚 Курсы Коучинга", url="https://t.me/kursy_biznes_kouchinga"),
+            InlineKeyboardButton(text="🎓 Обо мне / Кейсы", callback_data="about_coach")
         ],
         [
-            InlineKeyboardButton(text="⭐️ Отзывы клиентов", callback_data="show_reviews"),
-            InlineKeyboardButton(text="❓ Частые вопросы", callback_data="faq")
+            InlineKeyboardButton(text="🎯 Бесплатный гайд", callback_data="free_guide"),
+            InlineKeyboardButton(text="📞 Обратный звонок", callback_data="call_request")
         ]
     ])
     
@@ -260,7 +241,7 @@ async def start_cmd(message: Message, state: FSMContext):
         "• Увеличить доход в 2–5 раз без выгорания\n"
         "• Выстроить системный бизнес и делегировать рутину\n"
         "• Запустить продажи через автоворонки и личный бренд\n\n"
-        "💎 <b>Выберите нужный раздел или программу ниже:</b>"
+        "💎 <b>Переходите в наши проекты или выберите программу ниже:</b>"
     )
     
     await message.answer(welcome_text, reply_markup=welcome_keyboard)
@@ -276,7 +257,7 @@ async def about_coach(callback: CallbackQuery):
     text = (
         "🏆 <b>О Наставнике и Академии MetaImperiya</b>\n\n"
         "• Более 8 лет в бизнесе и цифровом маркетинге\n"
-        "• Более 100+ успешных кейсов учеников с суммарным оборотом > $1M\n"
+        "• 100+ успешных кейсов учеников с суммарным оборотом > $1M\n"
         "• Автор методик по системному росту и работе с мышлением\n\n"
         "👉 Наша цель — дать вам не просто теорию, а работающие инструменты и систему!"
     )
@@ -286,7 +267,7 @@ async def about_coach(callback: CallbackQuery):
 async def free_guide(callback: CallbackQuery):
     await callback.answer()
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📥 Скачать Гайд (PDF)", url=SITE_URL)]
+        [InlineKeyboardButton(text="📥 Скачать Гайд на сайте", url=SITE_URL)]
     ])
     await callback.message.answer(
         "🎁 <b>Заберите ваш бонус!</b>\n\n"
@@ -298,39 +279,13 @@ async def free_guide(callback: CallbackQuery):
 async def call_request(callback: CallbackQuery):
     await callback.answer()
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💬 Написать ассистенту", url="https://t.me/metaimperiya_support")]
+        [InlineKeyboardButton(text="💬 Написать в Бизнес-Консультант", url="https://t.me/Bizneskonsultant")]
     ])
     await callback.message.answer(
         "📞 <b>Обратный звонок / Диагностика</b>\n\n"
-        "Оставьте сообщение ассистенту, и мы подберем удобное время для бесплатной 15-минутной разбор-сессии!",
+        "Оставьте сообщение, и мы подберем удобное время для бесплатной 15-минутной разбор-сессии!",
         reply_markup=keyboard
     )
-
-@dp.callback_query(F.data == "show_reviews")
-async def show_reviews(callback: CallbackQuery):
-    await callback.answer()
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📱 Читать кейсы в канале", url=f"https://t.me/{CHANNEL_ID.replace('@', '')}")]
-    ])
-    await callback.message.answer(
-        "⭐️ <b>Отзывы и результаты учеников</b>\n\n"
-        "Все кейсы, аудио-отзывы и видео-интервью мы публикуем в нашем канале!",
-        reply_markup=keyboard
-    )
-
-@dp.callback_query(F.data == "faq")
-async def faq(callback: CallbackQuery):
-    await callback.answer()
-    faq_text = (
-        "❓ <b>Часто задаваемые вопросы (FAQ)</b>\n\n"
-        "🔹 <b>Подойдет ли мне коучинг, если я только начинаю?</b>\n"
-        "Да! Для старта отлично подойдет «Экспресс-разбор» или «Курс 2.0».\n\n"
-        "🔹 <b>В каком формате проходят занятия?</b>\n"
-        "Все встречи проходят в Zoom 1-на-1 или в мини-группе. Все записи сохраняются.\n\n"
-        "🔹 <b>Какая гарантия результата?</b>\n"
-        "При полном выполнении всех домашних заданий и рекомендаций вы гарантированно окупаете стоимость программы."
-    )
-    await callback.message.answer(faq_text)
 
 # ==================== ОФОРМЛЕНИЕ ЗАЯВОК (FSM) ====================
 @dp.message(F.text == "📝 Записаться на разбор")
@@ -406,16 +361,11 @@ async def finish_order(message: Message, state: FSMContext):
         f"🔗 @{message.from_user.username or 'нет'}"
     )
     
-    try:
-        await bot.send_message(chat_id=GROUP_ID, text=order_text)
-    except Exception as e:
-        logger.error(f"❌ Ошибка отправки в группу: {e}")
-    
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(chat_id=admin_id, text=order_text)
         except Exception as e:
-            logger.error(f"❌ Ошибка админу {admin_id}: {e}")
+            logger.error(f"❌ Ошибка отправки админу {admin_id}: {e}")
     
     await message.answer(
         "✅ <b>Заявка успешно принята!</b>\nМы свяжемся с вами в течение 15 минут для уточнения деталей.",
@@ -444,7 +394,7 @@ async def show_service_card(message: Message):
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✍️ Забронировать место", callback_data=f"order_{service_key}")],
-        [InlineKeyboardButton(text="💬 Задать вопрос", url="https://t.me/metaimperiya_support")]
+        [InlineKeyboardButton(text="💬 Написать консультанту", url="https://t.me/Bizneskonsultant")]
     ])
     
     await message.answer_photo(
@@ -483,15 +433,24 @@ async def site_link(message: Message):
 @dp.message(F.text == "💬 Отзывы учеников")
 async def reviews_text(message: Message):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📱 Смотреть кейсы", url=f"https://t.me/{CHANNEL_ID.replace('@', '')}")]
+        [InlineKeyboardButton(text="📱 Читать отзывы и кейсы", url="https://t.me/Biznes_kouching")]
     ])
     await message.answer("Все кейсы и отзывы опубликованы в нашем Telegram-канале:", reply_markup=keyboard)
 
 @dp.message(F.text == "❓ FAQ & Ответы")
 async def faq_menu(message: Message):
-    await faq(CallbackQuery(id="", from_user=message.from_user, chat_instance="", message=message, data=""))
+    faq_text = (
+        "❓ <b>Часто задаваемые вопросы (FAQ)</b>\n\n"
+        "🔹 <b>Подойдет ли мне коучинг, если я только начинаю?</b>\n"
+        "Да! Для старта отлично подойдет «Экспресс-разбор» или «Курс 2.0».\n\n"
+        "🔹 <b>В каком формате проходят занятия?</b>\n"
+        "Все встречи проходят в Zoom 1-на-1 или в мини-группе. Все записи сохраняются.\n\n"
+        "🔹 <b>Какая гарантия результата?</b>\n"
+        "При полном выполнении всех домашних заданий и рекомендаций вы гарантированно окупаете стоимость программы."
+    )
+    await message.answer(faq_text)
 
-# ==================== ВЕБ-СЕРВЕР И КЕЕP-ALIVE (БУДИЛЬНИК) ====================
+# ==================== ВЕБ-СЕРВЕР И KEEP-ALIVE ====================
 class WebServer:
     def __init__(self):
         self.app = web.Application()
@@ -508,9 +467,7 @@ class WebServer:
     async def handle_health(self, request):
         return web.json_response({
             "status": "ok",
-            "timestamp": datetime.now().isoformat(),
-            "channel": CHANNEL_ID,
-            "group": GROUP_ID
+            "timestamp": datetime.now().isoformat()
         })
 
     async def start(self):
@@ -529,7 +486,6 @@ class WebServer:
 web_server = WebServer()
 
 async def keep_alive_task():
-    """Фоновый цикл-будильник: каждые 10 минут отправляет запрос сам на себя"""
     await asyncio.sleep(10)
     async with aiohttp.ClientSession() as session:
         while True:
@@ -539,7 +495,7 @@ async def keep_alive_task():
                         logger.info(f"⏰ Keep-alive ping sent to {SITE_URL}, status: {resp.status}")
             except Exception as e:
                 logger.error(f"❌ Keep-alive error: {e}")
-            await asyncio.sleep(600)  # 10 минут
+            await asyncio.sleep(600)
 
 # ==================== ЗАПУСК ====================
 async def main():
@@ -550,7 +506,6 @@ async def main():
         await web_server.start()
         await bot.delete_webhook(drop_pending_updates=True)
         
-        # Запускаем фоновый «будильник»
         asyncio.create_task(keep_alive_task())
         
         logger.info("🤖 Бот готов к работе!")
@@ -564,4 +519,4 @@ async def main():
         logger.info("👋 Бот остановлен")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    async.run(main())
