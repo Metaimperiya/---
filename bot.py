@@ -292,7 +292,8 @@ def get_main_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="📈 Бизнес-коучинг"), KeyboardButton(text="💼 Бизнес-консалтинг")],
             [KeyboardButton(text="📊 Тренинги по продажам"), KeyboardButton(text="📚 Курсы бизнес-коучинга")],
             [KeyboardButton(text="🌐 Наш сайт"), KeyboardButton(text="📞 Заявка")],
-            [KeyboardButton(text="❓ Помощь"), KeyboardButton(text="📢 Наши каналы")]
+            [KeyboardButton(text="❓ Помощь"), KeyboardButton(text="📢 Наши каналы")],
+            [KeyboardButton(text="🎲 Кинуть кубик")]
         ],
         resize_keyboard=True,
         input_field_placeholder="Выберите услугу..."
@@ -313,7 +314,7 @@ def get_post_confirm_keyboard() -> InlineKeyboardMarkup:
     ])
 
 def get_start_keyboard() -> InlineKeyboardMarkup:
-    """Кнопки под видео при старте - 6 штук в 3 ряда"""
+    """Кнопки под видео при старте - 7 штук"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="🚀 Главный бот", url=MAIN_BOT_URL),
@@ -326,20 +327,42 @@ def get_start_keyboard() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="📊 Тренинги продаж", callback_data="service_sales"),
             InlineKeyboardButton(text="📚 Курсы коучинга", callback_data="service_courses")
+        ],
+        [
+            InlineKeyboardButton(text="🎲 Кинуть кубик", callback_data="roll_dice")
+        ]
+    ])
+
+def get_dice_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура для выбора типа кубика"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🎲 Кубик", callback_data="dice_🎲"),
+            InlineKeyboardButton(text="🎯 Дартс", callback_data="dice_🎯")
+        ],
+        [
+            InlineKeyboardButton(text="🏀 Баскетбол", callback_data="dice_🏀"),
+            InlineKeyboardButton(text="⚽ Футбол", callback_data="dice_⚽")
+        ],
+        [
+            InlineKeyboardButton(text="🎰 Автомат", callback_data="dice_🎰"),
+            InlineKeyboardButton(text="🎳 Боулинг", callback_data="dice_🎳")
+        ],
+        [
+            InlineKeyboardButton(text="🔙 Назад", callback_data="dice_back")
         ]
     ])
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-# ==================== СТАРТ С ВИДЕО И 6 КНОПКАМИ ====================
+# ==================== СТАРТ С ВИДЕО ====================
 @dp.message(CommandStart())
 async def start_cmd(message: Message, state: FSMContext):
     await state.clear()
     await db.save_action(message.from_user.id, "start", "Запуск бота")
     await notify_admin_about_action("🚀 Запуск бота", message.from_user)
     
-    # ТВОЕ ВИДЕО С GITHUB
     VIDEO_URL = "https://raw.githubusercontent.com/Metaimperiya/---/main/videos/METAIMPERIY%20(1).mp4"
     
     welcome_text = (
@@ -355,13 +378,11 @@ async def start_cmd(message: Message, state: FSMContext):
     )
     
     try:
-        # ОТПРАВЛЯЕМ ВИДЕО С 6 КНОПКАМИ ПОД НИМ
         await message.answer_video(
             video=VIDEO_URL,
             caption=welcome_text,
             reply_markup=get_start_keyboard()
         )
-        # И дополнительно отправляем основное меню
         await message.answer(
             "📋 <b>Главное меню:</b>",
             reply_markup=get_main_keyboard()
@@ -467,6 +488,8 @@ async def help_command(message: Message):
         "1. Выберите услугу из меню\n"
         "2. Нажмите 'Заказать'\n"
         "3. Заполните форму\n\n"
+        "🎲 <b>Игры:</b>\n"
+        "Нажмите 'Кинуть кубик' и выберите игру!\n\n"
         "📞 <b>Связь:</b>\n"
         "• Сайт: metaimperiya.com\n"
         "• Бот: @Biznes_kursy_bot\n\n"
@@ -480,7 +503,7 @@ async def help_command(message: Message):
 async def show_channels(message: Message):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📈 Бизнес-коучинг", url="https://t.me/Biznes_kouching")],
-        [InlineKeyboardButton(text="💼 Бизнес-консультант", url="https://t.me/Bizneskonsultant")],
+        [InlineKeyboardButton(text="💼 Бизнес-консалтинг", url="https://t.me/Bizneskonsultant")],
         [InlineKeyboardButton(text="📊 Тренинги продаж", url="https://t.me/Treningi_po_prodazham")],
         [InlineKeyboardButton(text="📚 Курсы коучинга", url="https://t.me/kursy_biznes_kouchinga")],
         [InlineKeyboardButton(text="🚀 Главный бот", url=MAIN_BOT_URL)]
@@ -496,6 +519,75 @@ async def show_channels(message: Message):
 async def cancel_order(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("❌ Отменено.", reply_markup=get_main_keyboard())
+
+# ==================== КУБИКИ (DICE) ====================
+
+@dp.message(F.text == "🎲 Кинуть кубик")
+async def roll_dice_menu(message: Message):
+    """Показывает меню выбора кубика"""
+    await db.save_action(message.from_user.id, "dice_menu", "Открыл меню кубиков")
+    await message.answer(
+        "🎲 <b>Выберите игру:</b>\n\n"
+        "🎲 Кубик - число от 1 до 6\n"
+        "🎯 Дартс - попадание в центр\n"
+        "🏀 Баскетбол - бросок в кольцо\n"
+        "⚽ Футбол - удар по воротам\n"
+        "🎰 Игровой автомат - 3 символа\n"
+        "🎳 Боулинг - сбитые кегли",
+        reply_markup=get_dice_keyboard()
+    )
+
+@dp.callback_query(F.data.startswith("dice_"))
+async def roll_dice_callback(callback: CallbackQuery):
+    await callback.answer()
+    
+    emoji = callback.data.replace("dice_", "")
+    
+    # Эмодзи для игр
+    emoji_map = {
+        "🎲": "🎲",
+        "🎯": "🎯",
+        "🏀": "🏀",
+        "⚽": "⚽",
+        "🎰": "🎰",
+        "🎳": "🎳"
+    }
+    
+    if emoji not in emoji_map:
+        await callback.message.answer("❌ Неизвестная игра")
+        return
+    
+    await db.save_action(callback.from_user.id, "dice", f"Бросок {emoji}")
+    
+    try:
+        dice_message = await callback.message.answer_dice(emoji=emoji)
+        result = dice_message.dice.value
+        
+        # Разные результаты для разных игр
+        result_texts = {
+            "🎲": f"🎲 <b>Вам выпало: {result}</b>",
+            "🎯": f"🎯 <b>Попадание: {result} очков</b>",
+            "🏀": f"🏀 <b>Результат броска: {result}</b>",
+            "⚽": f"⚽ <b>Результат удара: {result}</b>",
+            "🎰": f"🎰 <b>Результат: {result}</b>",
+            "🎳": f"🎳 <b>Сбито кеглей: {result}</b>"
+        }
+        
+        await callback.message.answer(
+            result_texts.get(emoji, f"🎲 <b>Результат: {result}</b>"),
+            reply_markup=get_dice_keyboard()
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при броске кубика: {e}")
+        await callback.message.answer("❌ Ошибка при броске. Попробуйте позже.")
+
+@dp.callback_query(F.data == "dice_back")
+async def dice_back(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.answer(
+        "📋 <b>Главное меню:</b>",
+        reply_markup=get_main_keyboard()
+    )
 
 # ==================== ЗАЯВКИ ====================
 @dp.message(OrderStates.service)
@@ -770,6 +862,16 @@ async def admin_test_notify(callback: CallbackQuery):
     await callback.answer()
     await notify_admin_about_action("🧪 Тестовое уведомление", callback.from_user)
     await callback.message.answer("✅ Тестовое уведомление отправлено!")
+
+# ==================== КОМАНДА /MENU ДЛЯ ГРУПП ====================
+@dp.message(Command("menu"))
+async def menu_command(message: Message):
+    """Команда /menu - показывает меню в группах и личке"""
+    await message.answer(
+        "📋 <b>Главное меню:</b>\n\n"
+        "Выберите услугу или игру:",
+        reply_markup=get_main_keyboard()
+    )
 
 # ==================== ВЕБ-СЕРВЕР ====================
 class WebServer:
