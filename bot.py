@@ -38,7 +38,7 @@ if not TOKEN:
 
 CHANNEL_ID = os.getenv("CHANNEL_ID", "@Biznes_trener")
 GROUP_ID = os.getenv("GROUP_ID", "@Bizneskonsultant")
-SITE_URL = "https://www.metaimperiya.com/"
+SITE_URL = os.getenv("SITE_URL", "https://www.metaimperiya.com/")
 MAIN_BOT_URL = "https://t.me/Biznes_kursy_bot"
 ADMIN_USERNAME = "@METAIMPERIYA"
 
@@ -888,10 +888,10 @@ class WebServer:
         return web.Response(text="OK", status=200)
 
     async def handle_health(self, request):
+        # МАЛЕНЬКИЙ ОТВЕТ ДЛЯ КРОНДЖОБА
         return web.json_response({
             "status": "ok",
-            "timestamp": datetime.now().isoformat(),
-            "channel": CHANNEL_ID
+            "timestamp": datetime.now().isoformat()
         })
 
     async def start(self):
