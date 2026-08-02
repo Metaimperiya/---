@@ -1,12 +1,10 @@
 import asyncio
 import os
 import logging
-import time
 from datetime import datetime
-from typing import Optional, Set, Dict, Any, List
+from typing import Optional, Set, Dict, Any, List, Union
 
 import aiosqlite
-import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.types import (
@@ -16,14 +14,19 @@ from aiogram.types import (
     InlineKeyboardMarkup, 
     InlineKeyboardButton, 
     CallbackQuery,
-    TelegramObject
+    WebAppInfo,
+    TelegramObject,
+    ChatMemberUpdated,
+    ChatJoinRequest
 )
-from aiogram.filters import CommandStart, Command, StateFilter
+from aiogram.filters import CommandStart, Command, StateFilter, ChatMemberUpdatedFilter, IS_NOT_MEMBER, IS_MEMBER
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramForbiddenError, TelegramAPIError
 
 # ==================== ЛОГИРОВАНИЕ ====================
 logging.basicConfig(
@@ -37,17 +40,25 @@ TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise ValueError("❌ BOT_TOKEN не установлен!")
 
-CHANNEL_ID = os.getenv("CHANNEL_ID", "@Biznes_kouching")
-GROUP_ID = os.getenv("GROUP_ID", "806159173")
+CHANNEL_ID = os.getenv("CHANNEL_ID", "@zakazat_sayt_dlya_shkoly")
+GROUP_ID = os.getenv("GROUP_ID", "@zakazatsaytdlyashkoly")
 SITE_URL = os.getenv("SITE_URL", "https://www.metaimperiya.com/")
 
+# !!! ВАЖНО: тут твой основной бот и твой профиль для уведомлений
+MAIN_BOT_URL = "https://t.me/Biznes_kursy_bot"
+ADMIN_USERNAME = "@METAIMPERIYA"  # Твой профиль для уведомлений
+
 ADMIN_IDS: Set[int] = set()
-raw_admin_ids = os.getenv("ADMIN_ID", "806159173")
+raw_admin_ids = os.getenv("ADMIN_ID", "")
 if raw_admin_ids:
     for part in raw_admin_ids.split(","):
         part = part.strip()
         if part.isdigit():
             ADMIN_IDS.add(int(part))
+    if ADMIN_IDS:
+        logger.info(f"✅ Админы: {ADMIN_IDS}")
+    else:
+        logger.warning("⚠️ ADMIN_ID не содержит корректных ID")
 
 # ==================== БАЗА ДАННЫХ ====================
 DB_NAME = os.getenv("DB_NAME", "bot_database.db")
@@ -81,6 +92,7 @@ class Database:
                     last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            
             await cursor.execute("""
                 CREATE TABLE IF NOT EXISTS orders (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -94,6 +106,27 @@ class Database:
                     status TEXT DEFAULT 'new'
                 )
             """)
+            
+            await cursor.execute("""
+                CREATE TABLE IF NOT EXISTS posts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    admin_id INTEGER,
+                    text TEXT,
+                    photo_id TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            await cursor.execute("""
+                CREATE TABLE IF NOT EXISTS user_actions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_id INTEGER,
+                    action_type TEXT,
+                    action_data TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
             await self._conn.commit()
             logger.info("✅ База данных готова")
 
@@ -124,6 +157,21 @@ class Database:
         await self._conn.commit()
         return cursor.lastrowid
 
+    async def save_post(self, admin_id: int, text: str, photo_id: Optional[str] = None) -> int:
+        cursor = await self._conn.execute(
+            "INSERT INTO posts (admin_id, text, photo_id) VALUES (?, ?, ?)",
+            (admin_id, text, photo_id)
+        )
+        await self._conn.commit()
+        return cursor.lastrowid
+    
+    async def save_action(self, telegram_id: int, action_type: str, action_data: str = ""):
+        await self._conn.execute(
+            "INSERT INTO user_actions (telegram_id, action_type, action_data) VALUES (?, ?, ?)",
+            (telegram_id, action_type, action_data[:200])
+        )
+        await self._conn.commit()
+
 db = Database()
 
 # ==================== MIDDLEWARE ====================
@@ -138,9 +186,93 @@ class UserTrackingMiddleware(BaseMiddleware):
                     first_name=user.first_name or "",
                     last_name=user.last_name or "",
                 )
+                
+                # Отправляем уведомление о новом пользователе
+                await notify_admin_about_user(user)
+                
             except Exception as e:
                 logger.error(f"Ошибка сохранения пользователя: {e}")
         return await handler(event, data)
+
+# ==================== УВЕДОМЛЕНИЯ АДМИНУ ====================
+async def notify_admin_about_user(user) -> bool:
+    """Отправляет уведомление админу о новом пользователе"""
+    try:
+        # Пытаемся отправить уведомление в личку @METAIMPERIYA
+        # Для этого нужно знать ID, но мы отправим через юзернейм
+        notification_text = (
+            "🔔 <b>НОВЫЙ ПОЛЬЗОВАТЕЛЬ!</b>\n\n"
+            f"👤 <b>Имя:</b> {user.first_name}\n"
+            f"🆔 <b>ID:</b> <code>{user.id}</code>\n"
+            f"📛 <b>Юзернейм:</b> @{user.username or 'нет'}\n"
+            f"🕐 <b>Время:</b> {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n\n"
+            f"🌐 <a href='{SITE_URL}'>На сайт</a> | <a href='{MAIN_BOT_URL}'>Главный бот</a>"
+        )
+        
+        # Отправляем админам из списка
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    chat_id=admin_id,
+                    text=notification_text,
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception as e:
+                logger.error(f"Не удалось отправить админу {admin_id}: {e}")
+        
+        # Также пытаемся отправить через юзернейм (если есть в контактах)
+        try:
+            await bot.send_message(
+                chat_id=ADMIN_USERNAME,
+                text=notification_text,
+                parse_mode=ParseMode.HTML
+            )
+        except Exception as e:
+            logger.error(f"Не удалось отправить @{ADMIN_USERNAME}: {e}")
+            
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка уведомления: {e}")
+        return False
+
+async def notify_admin_about_action(action_type: str, user, extra_data: str = ""):
+    """Уведомление о любом действии пользователя"""
+    try:
+        notification_text = (
+            f"📊 <b>ДЕЙСТВИЕ ПОЛЬЗОВАТЕЛЯ</b>\n\n"
+            f"🎯 <b>Действие:</b> {action_type}\n"
+            f"👤 <b>Имя:</b> {user.first_name}\n"
+            f"🆔 <b>ID:</b> <code>{user.id}</code>\n"
+            f"📛 <b>Юзернейм:</b> @{user.username or 'нет'}\n"
+            f"🕐 <b>Время:</b> {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n"
+        )
+        
+        if extra_data:
+            notification_text += f"\n📝 <b>Доп.инфо:</b> {extra_data}\n"
+        
+        notification_text += f"\n🌐 <a href='{SITE_URL}'>На сайт</a> | <a href='{MAIN_BOT_URL}'>Главный бот</a>"
+        
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    chat_id=admin_id,
+                    text=notification_text,
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception as e:
+                logger.error(f"Не удалось отправить админу {admin_id}: {e}")
+                
+        try:
+            await bot.send_message(
+                chat_id=ADMIN_USERNAME,
+                text=notification_text,
+                parse_mode=ParseMode.HTML
+            )
+        except Exception as e:
+            logger.error(f"Не удалось отправить @{ADMIN_USERNAME}: {e}")
+            
+    except Exception as e:
+        logger.error(f"Ошибка уведомления о действии: {e}")
 
 # ==================== ИНИЦИАЛИЗАЦИЯ БОТА ====================
 bot = Bot(
@@ -150,39 +282,45 @@ bot = Bot(
 dp = Dispatcher(storage=MemoryStorage())
 dp.update.outer_middleware(UserTrackingMiddleware())
 
-# ==================== КУРСЫ ПО БИЗНЕС-КОУЧИНГУ ====================
+# ==================== ДАННЫЕ УСЛУГ (В ДОЛЛАРАХ) ====================
 SERVICES = {
-    "express_coaching": {
-        "emoji": "⚡",
-        "name": "Экспресс-разбор бизнеса",
-        "price": "от $150",
-        "description": "• 1.5 часа интенсивной работы 1-на-1\n• Поиск точек роста и устранение «узких мест»\n• Пошаговый план действий на 30 дней",
-        "photo": "https://images.unsplash.com/photo-1552664730-d307ca884978?auto=format&fit=crop&w=800&q=80",
+    "album": {
+        "emoji": "🎓",
+        "name": "Выпускной альбом / Класс",
+        "price": "от $80",
+        "description": "• Живые фото и видео\n• Персональная страница каждого ученика\n• Онлайн-таймер до выпускного",
+        "photo": "https://images.unsplash.com/photo-1523240795612-9a054b0db644?auto=format&fit=crop&w=800&q=80",
     },
-    "group_mentorship": {
-        "emoji": "🚀",
-        "name": "Групповое наставничество",
-        "price": "от $490/мес",
-        "description": "• 2 месяца совместной работы в мини-группе\n• Еженедельные зум-разборы и домашние задания\n• Сильное окружение предпринимателей и нетворкинг",
-        "photo": "https://images.unsplash.com/photo-1531482615713-2afd69097998?auto=format&fit=crop&w=800&q=80",
+    "primary": {
+        "emoji": "🎒",
+        "name": "Сайт для 1-4 классов",
+        "price": "от $65",
+        "description": "• Расписание уроков и объявлений\n• Фотоотчеты с мероприятий и экскурсий\n• Удобный доступ для родителей",
+        "photo": "https://images.unsplash.com/photo-1509062522246-3755977927d7?auto=format&fit=crop&w=800&q=80",
     },
-    "vip_mentorship": {
-        "emoji": "👑",
-        "name": "VIP Личное Наставничество",
-        "price": "от $1,500",
-        "description": "• Полный консалтинг вашего бизнеса на 3 месяца\n• Построение отдела продаж, найм и автоворонки\n• Прямой доступ ко мне в Telegram 24/7",
-        "photo": "https://images.unsplash.com/photo-1507679799987-c73779587ccf?auto=format&fit=crop&w=800&q=80",
+    "school": {
+        "emoji": "🏫",
+        "name": "Официальный сайт школы",
+        "price": "от $220",
+        "description": "• Полное соответствие стандартам\n• Разделы: Документы, Педсостав, Новости\n• Высокая защита и быстродействие",
+        "photo": "https://images.unsplash.com/photo-1580582932707-520aed937b7b?auto=format&fit=crop&w=800&q=80",
     },
-    "scaling_course": {
-        "emoji": "📈",
-        "name": "Курс «Бизнес-Масштаб 2.0»",
-        "price": "от $290",
-        "description": "• Онлайн-курс с видео-уроками\n• Шаблоны, таблицы финансового учета и регламенты\n• Сертификат о прохождении + чат поддержки",
-        "photo": "https://images.unsplash.com/photo-1460925895917-afdab827c52f?auto=format&fit=crop&w=800&q=80",
+    "portfolio": {
+        "emoji": "🏆",
+        "name": "Портфолио ученика / Учителя",
+        "price": "от $40",
+        "description": "• Для аттестации учителя или поступления ученика\n• Галерея грамот, проектов и достижений\n• Презентабельный вид на любых устройствах",
+        "photo": "https://images.unsplash.com/photo-1434030216411-0b793f4b4173?auto=format&fit=crop&w=800&q=80",
     }
 }
 
 # ==================== СОСТОЯНИЯ FSM ====================
+class PostStates(StatesGroup):
+    waiting_for_photo = State()
+    waiting_for_text = State()
+    waiting_for_buttons = State()
+    waiting_for_confirmation = State()
+
 class OrderStates(StatesGroup):
     service = State()
     name = State()
@@ -191,17 +329,18 @@ class OrderStates(StatesGroup):
 
 # ==================== КЛАВИАТУРЫ ====================
 def get_main_keyboard() -> ReplyKeyboardMarkup:
+    """Главное меню со ВСЕМИ ссылками"""
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="⚡ Экспресс-разбор бизнеса")],
-            [KeyboardButton(text="🚀 Групповое наставничество")],
-            [KeyboardButton(text="👑 VIP Личное Наставничество")],
-            [KeyboardButton(text="📈 Курс «Бизнес-Масштаб 2.0»")],
-            [KeyboardButton(text="🌐 Наш сайт"), KeyboardButton(text="📝 Записаться на разбор")],
-            [KeyboardButton(text="❓ FAQ & Ответы"), KeyboardButton(text="💬 Отзывы учеников")]
+            [KeyboardButton(text="🎓 Выпускной альбом / Класс")],
+            [KeyboardButton(text="🎒 Сайт для 1-4 классов")],
+            [KeyboardButton(text="🏫 Официальный сайт школы")],
+            [KeyboardButton(text="🏆 Портфолио ученика / Учителя")],
+            [KeyboardButton(text="📱 Наш сайт"), KeyboardButton(text="📞 Заявка")],
+            [KeyboardButton(text="❓ Помощь"), KeyboardButton(text="💼 Вакансии")]
         ],
         resize_keyboard=True,
-        input_field_placeholder="Выберите программу коучинга..."
+        input_field_placeholder="Выберите услугу..."
     )
 
 def get_cancel_keyboard() -> ReplyKeyboardMarkup:
@@ -210,89 +349,476 @@ def get_cancel_keyboard() -> ReplyKeyboardMarkup:
         resize_keyboard=True
     )
 
+def get_post_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Опубликовать", callback_data="post_publish")],
+        [InlineKeyboardButton(text="✏️ Редактировать текст", callback_data="post_edit_text")],
+        [InlineKeyboardButton(text="🔄 Изменить фото", callback_data="post_edit_photo")],
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="post_cancel")]
+    ])
+
+def get_channel_menu() -> InlineKeyboardMarkup:
+    """Меню для каналов и групп - со ВСЕМИ ссылками"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🚀 Главный бот", url=MAIN_BOT_URL),
+            InlineKeyboardButton(text="🌐 Наш сайт", url=SITE_URL)
+        ],
+        [
+            InlineKeyboardButton(text="📈 Бизнес-коучинг", url="https://t.me/Biznes_kouching"),
+            InlineKeyboardButton(text="💼 Бизнес-консультант", url="https://t.me/Bizneskonsultant")
+        ],
+        [
+            InlineKeyboardButton(text="📊 Тренинги продаж", url="https://t.me/Treningi_po_prodazham"),
+            InlineKeyboardButton(text="📚 Курсы коучинга", url="https://t.me/kursy_biznes_kouchinga")
+        ],
+        [
+            InlineKeyboardButton(text="📝 Заказать услугу", callback_data="order_from_channel"),
+            InlineKeyboardButton(text="❓ FAQ", callback_data="faq")
+        ]
+    ])
+
+def get_site_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура с сайтом и ботом"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌐 Перейти на сайт", url=SITE_URL)],
+        [InlineKeyboardButton(text="🤖 Главный бот", url=MAIN_BOT_URL)],
+        [InlineKeyboardButton(text="📢 Наши каналы", callback_data="show_channels")]
+    ])
+
+def get_all_links_keyboard() -> InlineKeyboardMarkup:
+    """Все ссылки в одной клавиатуре"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🚀 Главный бот", url=MAIN_BOT_URL),
+            InlineKeyboardButton(text="🌐 Сайт", url=SITE_URL)
+        ],
+        [
+            InlineKeyboardButton(text="📈 Коучинг", url="https://t.me/Biznes_kouching"),
+            InlineKeyboardButton(text="💼 Консалтинг", url="https://t.me/Bizneskonsultant")
+        ],
+        [
+            InlineKeyboardButton(text="📊 Тренинги", url="https://t.me/Treningi_po_prodazham"),
+            InlineKeyboardButton(text="📚 Курсы", url="https://t.me/kursy_biznes_kouchinga")
+        ]
+    ])
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
 # ==================== ПРИВЕТСТВИЕ С КНОПКАМИ ====================
 @dp.message(CommandStart())
 async def start_cmd(message: Message, state: FSMContext):
+    """Стартовая команда со всеми ссылками"""
     await state.clear()
+    
+    # Сохраняем действие
+    await db.save_action(message.from_user.id, "start", "Запуск бота")
+    
+    # Уведомляем админа
+    await notify_admin_about_action("🚀 Запуск бота", message.from_user)
     
     welcome_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🌐 Официальный сайт", url=SITE_URL),
-            InlineKeyboardButton(text="📢 Бизнес Коучинг", url="https://t.me/Biznes_kouching")
+            InlineKeyboardButton(text="🚀 Главный бот", url=MAIN_BOT_URL),
+            InlineKeyboardButton(text="🌐 Наш сайт", url=SITE_URL)
         ],
         [
-            InlineKeyboardButton(text="💼 Бизнес Консультант", url="https://t.me/Bizneskonsultant"),
-            InlineKeyboardButton(text="🎯 Тренинги по продажам", url="https://t.me/Treningi_po_prodazham")
+            InlineKeyboardButton(text="📈 Бизнес-коучинг", url="https://t.me/Biznes_kouching"),
+            InlineKeyboardButton(text="💼 Бизнес-консультант", url="https://t.me/Bizneskonsultant")
         ],
         [
-            InlineKeyboardButton(text="📚 Курсы Коучинга", url="https://t.me/kursy_biznes_kouchinga"),
-            InlineKeyboardButton(text="🎓 Обо мне / Кейсы", callback_data="about_coach")
+            InlineKeyboardButton(text="📊 Тренинги продаж", url="https://t.me/Treningi_po_prodazham"),
+            InlineKeyboardButton(text="📚 Курсы бизнес-коучинга", url="https://t.me/kursy_biznes_kouchinga")
         ],
         [
-            InlineKeyboardButton(text="🎯 Бесплатный гайд", callback_data="free_guide"),
-            InlineKeyboardButton(text="📞 Обратный звонок", callback_data="call_request")
+            InlineKeyboardButton(text="📞 Заказать звонок", callback_data="call_request"),
+            InlineKeyboardButton(text="❓ Частые вопросы", callback_data="faq")
         ]
     ])
     
     welcome_text = (
-        f"🔥 <b>Приветствую, {message.from_user.first_name}!</b>\n\n"
-        "Добро пожаловать в Академию Бизнес-Коучинга & Наставничества <b>MetaImperiya</b>! 🚀\n\n"
-        "Мы помогаем предпринимателям и экспертам:\n"
-        "• Увеличить доход в 2–5 раз без выгорания\n"
-        "• Выстроить системный бизнес и делегировать рутину\n"
-        "• Запустить продажи через автоворонки и личный бренд\n\n"
-        "💎 <b>Переходите в наши проекты или выберите программу ниже:</b>"
-    )
+        f"👋 <b>Салам, {message.from_user.first_name}!</b>\n\n"
+        "Добро пожаловать в <b>MetaImperiya</b>! 🚀\n\n"
+        "🎯 <b>Наши проекты:</b>\n"
+        "🤖 <a href='{}'>Главный бот</a> - бизнес-курсы\n"
+        "🌐 <a href='{}'>Сайт</a> - полная информация\n\n"
+        "📢 <b>Наши каналы:</b>\n"
+        "• <a href='https://t.me/Biznes_kouching'>Бизнес-коучинг</a>\n"
+        "• <a href='https://t.me/Bizneskonsultant'>Бизнес-консультант</a>\n"
+        "• <a href='https://t.me/Treningi_po_prodazham'>Тренинги продаж</a>\n"
+        "• <a href='https://t.me/kursy_biznes_kouchinga'>Курсы коучинга</a>\n\n"
+        "💰 <b>Все цены указаны в USD</b>\n\n"
+        "📌 <b>Выберите действие ниже:</b>"
+    ).format(MAIN_BOT_URL, SITE_URL)
     
     await message.answer(welcome_text, reply_markup=welcome_keyboard)
     await message.answer(
-        "Вы также можете выбрать готовую программу коучинга из меню:",
+        "Или выберите услугу в меню ниже:",
         reply_markup=get_main_keyboard()
     )
 
+# ==================== ОБРАБОТКА ВХОДА В КАНАЛ/ГРУППУ ====================
+@dp.chat_member()
+async def chat_member_update(event: ChatMemberUpdated):
+    """Отслеживаем, когда пользователь заходит в канал/группу"""
+    if event.new_chat_member.status == "member":
+        user = event.from_user
+        chat = event.chat
+        
+        # Сохраняем действие
+        await db.save_action(
+            user.id, 
+            "join_chat", 
+            f"Вступил в {chat.title} ({chat.id})"
+        )
+        
+        # Уведомляем админа
+        await notify_admin_about_action(
+            f"➕ Вступил в канал/группу: {chat.title}", 
+            user,
+            f"Чат ID: {chat.id}"
+        )
+        
+        # Отправляем приветствие с меню
+        try:
+            welcome_text = (
+                f"👋 <b>Добро пожаловать, {user.first_name}!</b>\n\n"
+                "🎯 <b>Наши ресурсы:</b>\n"
+                "🤖 <a href='{}'>Главный бот</a> - бизнес-курсы\n"
+                "🌐 <a href='{}'>Сайт</a> - полная информация\n\n"
+                "📢 <b>Другие наши каналы:</b>\n"
+                "• <a href='https://t.me/Biznes_kouching'>Бизнес-коучинг</a>\n"
+                "• <a href='https://t.me/Bizneskonsultant'>Бизнес-консультант</a>\n"
+                "• <a href='https://t.me/Treningi_po_prodazham'>Тренинги продаж</a>\n"
+                "• <a href='https://t.me/kursy_biznes_kouchinga'>Курсы коучинга</a>"
+            ).format(MAIN_BOT_URL, SITE_URL)
+            
+            await bot.send_message(
+                chat_id=user.id,
+                text=welcome_text,
+                reply_markup=get_channel_menu()
+            )
+        except Exception as e:
+            logger.error(f"Не удалось отправить приветствие пользователю {user.id}: {e}")
+
+# ==================== ОБРАБОТКА ЗАЯВОК НА ВСТУПЛЕНИЕ ====================
+@dp.chat_join_request()
+async def handle_join_request(event: ChatJoinRequest):
+    """Обработка заявок на вступление в закрытые каналы"""
+    user = event.from_user
+    chat = event.chat
+    
+    # Автоматически одобряем заявку
+    try:
+        await event.approve()
+        
+        # Сохраняем действие
+        await db.save_action(
+            user.id,
+            "join_request_approved",
+            f"Одобрена заявка в {chat.title}"
+        )
+        
+        # Уведомляем админа
+        await notify_admin_about_action(
+            f"✅ Одобрена заявка в {chat.title}",
+            user
+        )
+        
+        # Отправляем приветствие
+        welcome_text = (
+            f"👋 <b>Добро пожаловать, {user.first_name}!</b>\n\n"
+            "🎯 <b>Наши ресурсы:</b>\n"
+            "🤖 <a href='{}'>Главный бот</a> - бизнес-курсы\n"
+            "🌐 <a href='{}'>Сайт</a> - полная информация\n\n"
+            "📢 <b>Наши каналы:</b>\n"
+            "• <a href='https://t.me/Biznes_kouching'>Бизнес-коучинг</a>\n"
+            "• <a href='https://t.me/Bizneskonsultant'>Бизнес-консультант</a>\n"
+            "• <a href='https://t.me/Treningi_po_prodazham'>Тренинги продаж</a>\n"
+            "• <a href='https://t.me/kursy_biznes_kouchinga'>Курсы коучинга</a>"
+        ).format(MAIN_BOT_URL, SITE_URL)
+        
+        await bot.send_message(
+            chat_id=user.id,
+            text=welcome_text,
+            reply_markup=get_channel_menu()
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка обработки заявки: {e}")
+
 # ==================== CALLBACK ДЛЯ ПРИВЕТСТВИЯ ====================
-@dp.callback_query(F.data == "about_coach")
-async def about_coach(callback: CallbackQuery):
-    await callback.answer()
-    text = (
-        "🏆 <b>О Наставнике и Академии MetaImperiya</b>\n\n"
-        "• Более 8 лет в бизнесе и цифровом маркетинге\n"
-        "• 100+ успешных кейсов учеников с суммарным оборотом > $1M\n"
-        "• Автор методик по системному росту и работе с мышлением\n\n"
-        "👉 Наша цель — дать вам не просто теорию, а работающие инструменты и систему!"
-    )
-    await callback.message.answer(text)
-
-@dp.callback_query(F.data == "free_guide")
-async def free_guide(callback: CallbackQuery):
-    await callback.answer()
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📥 Скачать Гайд на сайте", url=SITE_URL)]
-    ])
-    await callback.message.answer(
-        "🎁 <b>Заберите ваш бонус!</b>\n\n"
-        "Пошаговый чек-лист: <i>«5 шагов к выходу из операционки и удвоению чистой прибыли»</i>.",
-        reply_markup=keyboard
-    )
-
 @dp.callback_query(F.data == "call_request")
 async def call_request(callback: CallbackQuery):
+    """Заказ звонка"""
     await callback.answer()
+    
+    # Сохраняем действие
+    await db.save_action(callback.from_user.id, "call_request", "Запрос звонка")
+    await notify_admin_about_action("📞 Запрос звонка", callback.from_user)
+    
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💬 Написать в Бизнес-Консультант", url="https://t.me/Bizneskonsultant")]
+        [InlineKeyboardButton(text="🚀 Главный бот", url=MAIN_BOT_URL)],
+        [InlineKeyboardButton(text="🌐 Наш сайт", url=SITE_URL)]
     ])
+    
     await callback.message.answer(
-        "📞 <b>Обратный звонок / Диагностика</b>\n\n"
-        "Оставьте сообщение, и мы подберем удобное время для бесплатной 15-минутной разбор-сессии!",
+        "📞 <b>Заказать звонок</b>\n\n"
+        "Напишите нам в главном боте, и мы перезвоним вам в течение 15 минут!\n\n"
+        "📌 <i>Укажите удобное время для звонка</i>",
         reply_markup=keyboard
     )
 
-# ==================== ОФОРМЛЕНИЕ ЗАЯВОК (FSM) ====================
-@dp.message(F.text == "📝 Записаться на разбор")
+@dp.callback_query(F.data == "show_channels")
+async def show_channels(callback: CallbackQuery):
+    """Показать все каналы"""
+    await callback.answer()
+    
+    await callback.message.answer(
+        "📢 <b>Наши каналы и ресурсы</b>\n\n"
+        "🤖 <b>Главный бот:</b>\n"
+        f"<a href='{MAIN_BOT_URL}'>Biznes_kursy_bot</a>\n\n"
+        "🌐 <b>Сайт:</b>\n"
+        f"<a href='{SITE_URL}'>MetaImperiya</a>\n\n"
+        "📈 <b>Бизнес-коучинг:</b>\n"
+        "<a href='https://t.me/Biznes_kouching'>@Biznes_kouching</a>\n\n"
+        "💼 <b>Бизнес-консультант:</b>\n"
+        "<a href='https://t.me/Bizneskonsultant'>@Bizneskonsultant</a>\n\n"
+        "📊 <b>Тренинги продаж:</b>\n"
+        "<a href='https://t.me/Treningi_po_prodazham'>@Treningi_po_prodazham</a>\n\n"
+        "📚 <b>Курсы бизнес-коучинга:</b>\n"
+        "<a href='https://t.me/kursy_biznes_kouchinga'>@kursy_biznes_kouchinga</a>",
+        reply_markup=get_all_links_keyboard()
+    )
+
+@dp.callback_query(F.data == "order_from_channel")
+async def order_from_channel(callback: CallbackQuery, state: FSMContext):
+    """Заказ из канала"""
+    await callback.answer()
+    await callback.message.answer(
+        "📝 <b>Оформление заявки</b>\n\n"
+        "Напишите, какой проект вас интересует:",
+        reply_markup=get_cancel_keyboard()
+    )
+    await state.set_state(OrderStates.service)
+
+@dp.callback_query(F.data == "show_portfolio")
+async def show_portfolio(callback: CallbackQuery):
+    """Показать портфолио"""
+    await callback.answer()
+    
+    await db.save_action(callback.from_user.id, "view_portfolio", "Просмотр портфолио")
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌐 Смотреть все проекты", url=SITE_URL)],
+        [InlineKeyboardButton(text="🚀 Главный бот", url=MAIN_BOT_URL)]
+    ])
+    
+    await callback.message.answer(
+        "📸 <b>Наши работы</b>\n\n"
+        "Мы создали более 100+ проектов для школ и учебных заведений.\n\n"
+        "🎯 <b>Примеры наших работ:</b>\n"
+        "• Интерактивные выпускные альбомы\n"
+        "• Современные сайты для школ\n"
+        "• Цифровые портфолио\n\n"
+        "👉 <i>Все проекты смотрите на нашем сайте:</i>",
+        reply_markup=keyboard
+    )
+
+@dp.callback_query(F.data == "faq")
+async def faq(callback: CallbackQuery):
+    """Частые вопросы"""
+    await callback.answer()
+    
+    await db.save_action(callback.from_user.id, "faq", "Просмотр FAQ")
+    
+    faq_text = (
+        "❓ <b>Частые вопросы</b>\n\n"
+        "🔹 <b>Сколько времени занимает разработка?</b>\n"
+        "Обычно 3-7 дней, в зависимости от сложности проекта.\n\n"
+        "🔹 <b>Какая оплата?</b>\n"
+        "Работаем по предоплате 50%. Оплата в USD.\n\n"
+        "🔹 <b>Что нужно для старта?</b>\n"
+        "Достаточно заполнить заявку или написать менеджеру.\n\n"
+        "🔹 <b>Есть ли гарантия?</b>\n"
+        "Да, мы даем гарантию 6 месяцев на все работы.\n\n"
+        "🔹 <b>Можно ли внести правки?</b>\n"
+        "Да, мы вносим правки до полного утверждения.\n\n"
+        "📌 <i>Остались вопросы? Напишите менеджеру!</i>"
+    )
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚀 Главный бот", url=MAIN_BOT_URL)],
+        [InlineKeyboardButton(text="🌐 Наш сайт", url=SITE_URL)]
+    ])
+    
+    await callback.message.answer(faq_text, reply_markup=keyboard)
+
+# ==================== ПУБЛИКАЦИЯ В КАНАЛ (POST MAKER) ====================
+@dp.message(Command("post"))
+async def start_post_creation(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Доступ запрещен!")
+        return
+
+    await state.set_state(PostStates.waiting_for_photo)
+    await message.answer(
+        "📝 <b>Создание поста для канала</b>\n\n"
+        "Отправьте <b>фотографию</b> или нажмите /skip\n"
+        "🔄 /cancel - отмена"
+    )
+
+@dp.message(Command("cancel"), StateFilter(PostStates))
+async def cancel_post(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("❌ Создание поста отменено.", reply_markup=get_main_keyboard())
+
+@dp.message(Command("skip"), PostStates.waiting_for_photo)
+async def skip_photo(message: Message, state: FSMContext):
+    await state.update_data(photo=None)
+    await state.set_state(PostStates.waiting_for_text)
+    await message.answer("✏️ Введите <b>текст поста</b> (поддерживается HTML):")
+
+@dp.message(PostStates.waiting_for_photo, F.photo)
+async def process_photo(message: Message, state: FSMContext):
+    photo_id = message.photo[-1].file_id
+    await state.update_data(photo=photo_id)
+    await state.set_state(PostStates.waiting_for_text)
+    await message.answer("✅ Фото принято! Теперь введите <b>текст поста</b>:")
+
+@dp.message(PostStates.waiting_for_text)
+async def process_text(message: Message, state: FSMContext):
+    await state.update_data(text=message.text)
+    await state.set_state(PostStates.waiting_for_buttons)
+    
+    example = (
+        "🔘 <b>Добавьте кнопки</b>\n\n"
+        "Формат: <code>Текст - https://ссылка.com</code>\n"
+        "Пример:\n"
+        "<code>Заказать - https://t.me/Biznes_kursy_bot</code>\n"
+        "📌 /skip - если кнопки не нужны"
+    )
+    await message.answer(example)
+
+@dp.message(Command("skip"), PostStates.waiting_for_buttons)
+async def skip_buttons(message: Message, state: FSMContext):
+    await state.update_data(buttons=[])
+    await show_post_preview(message, state)
+
+@dp.message(PostStates.waiting_for_buttons)
+async def process_buttons(message: Message, state: FSMContext):
+    lines = message.text.strip().split("\n")
+    buttons = []
+    
+    for line in lines:
+        if " - " in line:
+            parts = line.split(" - ", 1)
+            btn_text = parts[0].strip()
+            btn_url = parts[1].strip()
+            
+            if btn_url.startswith(("http://", "https://", "tg://")):
+                buttons.append([InlineKeyboardButton(text=btn_text, url=btn_url)])
+    
+    if not buttons:
+        await message.answer("⚠️ Не найдено кнопок. Нажмите /skip")
+        return
+    
+    await state.update_data(buttons=buttons)
+    await show_post_preview(message, state)
+
+async def show_post_preview(message: Message, state: FSMContext):
+    data = await state.get_data()
+    text = data.get("text", "")
+    photo = data.get("photo")
+    buttons = data.get("buttons", [])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+    
+    preview_text = (
+        "📋 <b>Превью поста</b>\n\n"
+        f"📝 {text[:300]}{'...' if len(text) > 300 else ''}\n\n"
+        f"🖼 Фото: {'✅' if photo else '❌'}\n"
+        f"🔘 Кнопки: {len(buttons)} шт.\n\n"
+        "👇 Нажмите 'Опубликовать'"
+    )
+    
+    try:
+        if photo:
+            await message.answer_photo(
+                photo=photo,
+                caption=preview_text,
+                reply_markup=get_post_confirm_keyboard()
+            )
+        else:
+            await message.answer(preview_text, reply_markup=get_post_confirm_keyboard())
+        
+        await state.set_state(PostStates.waiting_for_confirmation)
+    except Exception as e:
+        logger.error(f"Ошибка: {e}")
+        await message.answer(f"❌ Ошибка: {e}")
+
+@dp.callback_query(F.data == "post_publish", PostStates.waiting_for_confirmation)
+async def publish_post(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    
+    if not is_admin(callback.from_user.id):
+        await callback.message.answer("⛔ Доступ запрещен!")
+        return
+    
+    data = await state.get_data()
+    text = data.get("text", "")
+    photo = data.get("photo")
+    buttons = data.get("buttons", [])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+    
+    try:
+        if photo:
+            await bot.send_photo(chat_id=CHANNEL_ID, photo=photo, caption=text, reply_markup=keyboard)
+        else:
+            await bot.send_message(chat_id=CHANNEL_ID, text=text, reply_markup=keyboard)
+        
+        await db.save_post(admin_id=callback.from_user.id, text=text, photo_id=photo)
+        
+        await bot.send_message(
+            chat_id=GROUP_ID,
+            text=f"📢 <b>Новый пост!</b>\n\n{text[:200]}...",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📱 Перейти в канал", url=f"https://t.me/{CHANNEL_ID.replace('@', '')}")]
+            ])
+        )
+        
+        await callback.message.answer(f"✅ <b>Пост опубликован!</b>\n📢 {CHANNEL_ID}")
+        await state.clear()
+    except Exception as e:
+        logger.error(f"Ошибка: {e}")
+        await callback.message.answer(f"❌ Ошибка: {e}")
+
+@dp.callback_query(F.data == "post_edit_text", PostStates.waiting_for_confirmation)
+async def edit_post_text(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(PostStates.waiting_for_text)
+    await callback.message.answer("✏️ Введите новый текст:")
+
+@dp.callback_query(F.data == "post_edit_photo", PostStates.waiting_for_confirmation)
+async def edit_post_photo(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(PostStates.waiting_for_photo)
+    await callback.message.answer("📸 Отправьте новое фото или /skip:")
+
+@dp.callback_query(F.data == "post_cancel", PostStates.waiting_for_confirmation)
+async def cancel_publish(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.clear()
+    await callback.message.answer("❌ Отменено.", reply_markup=get_main_keyboard())
+
+# ==================== ОФОРМЛЕНИЕ ЗАЯВОК ====================
+@dp.message(F.text == "📞 Заявка")
 async def start_order(message: Message, state: FSMContext):
     await state.set_state(OrderStates.service)
     await message.answer(
-        "📝 <b>Запись на консультацию / коучинг</b>\n\nУкажите, какая программа или цель вас интересует:",
+        "📝 <b>Оформление заявки</b>\n\nНапишите, какой проект вас интересует:",
         reply_markup=get_cancel_keyboard()
     )
 
@@ -305,26 +831,26 @@ async def cancel_order(message: Message, state: FSMContext):
 async def process_service(message: Message, state: FSMContext):
     await state.update_data(service=message.text)
     await state.set_state(OrderStates.name)
-    await message.answer("👤 Как к вам обращаться (Ваше имя)?", reply_markup=get_cancel_keyboard())
+    await message.answer("👤 Как к вам обращаться?", reply_markup=get_cancel_keyboard())
 
 @dp.message(OrderStates.name)
 async def process_name(message: Message, state: FSMContext):
     await state.update_data(name=message.text)
     await state.set_state(OrderStates.contact)
-    await message.answer("📱 Укажите ваш телефон или @username в Telegram:", reply_markup=get_cancel_keyboard())
+    await message.answer("📱 Укажите телефон или @username:", reply_markup=get_cancel_keyboard())
 
 @dp.message(OrderStates.contact)
 async def process_contact(message: Message, state: FSMContext):
     await state.update_data(contact=message.text)
     await state.set_state(OrderStates.comment)
     await message.answer(
-        "💬 Коротко опишите вашу текущую ситуацию в бизнесе (или /skip):",
+        "💬 Комментарий (необязательно):\n/skip - пропустить",
         reply_markup=get_cancel_keyboard()
     )
 
 @dp.message(Command("skip"), OrderStates.comment)
 async def skip_comment(message: Message, state: FSMContext):
-    await state.update_data(comment="Не указано")
+    await state.update_data(comment="Нет")
     await finish_order(message, state)
 
 @dp.message(OrderStates.comment)
@@ -344,36 +870,64 @@ async def finish_order(message: Message, state: FSMContext):
             comment=data.get('comment', 'Нет'),
             username=message.from_user.username or "нет_юзернейма"
         )
+        logger.info(f"✅ Заявка #{order_id} создана")
+        
+        # Сохраняем действие
+        await db.save_action(
+            message.from_user.id,
+            "order_created",
+            f"Заявка #{order_id}: {data.get('service', '')}"
+        )
+        
+        # Уведомляем админа
+        await notify_admin_about_action(
+            f"📝 Новая заявка #{order_id}",
+            message.from_user,
+            f"Услуга: {data.get('service', '')}"
+        )
+        
     except Exception as e:
-        logger.error(f"❌ Ошибка БД: {e}")
-        await message.answer("❌ Ошибка при сохранении заявки")
+        logger.error(f"❌ Ошибка: {e}")
+        await message.answer("❌ Ошибка при сохранении")
         await state.clear()
         return
     
     order_text = (
-        "🚀 <b>НОВАЯ ЗАЯВКА НА КОУЧИНГ!</b>\n"
+        "🚀 <b>НОВАЯ ЗАЯВКА!</b>\n"
         f"🆔 №: {order_id}\n"
         f"🕐 {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
         f"👤 Клиент: {data.get('name')}\n"
-        f"🛠 Направление: {data.get('service')}\n"
+        f"🛠 Услуга: {data.get('service')}\n"
         f"📞 Контакт: {data.get('contact')}\n"
-        f"💬 Описание: {data.get('comment')}\n"
+        f"💬 Коммент: {data.get('comment')}\n"
         f"🔗 @{message.from_user.username or 'нет'}"
     )
+    
+    try:
+        await bot.send_message(chat_id=GROUP_ID, text=order_text)
+        logger.info(f"📨 Заявка в группу {GROUP_ID}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка: {e}")
     
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(chat_id=admin_id, text=order_text)
         except Exception as e:
-            logger.error(f"❌ Ошибка отправки админу {admin_id}: {e}")
+            logger.error(f"❌ Ошибка админу {admin_id}: {e}")
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌐 Перейти на сайт", url=SITE_URL)],
+        [InlineKeyboardButton(text="🚀 Главный бот", url=MAIN_BOT_URL)]
+    ])
     
     await message.answer(
-        "✅ <b>Заявка успешно принята!</b>\nМы свяжемся с вами в течение 15 минут для уточнения деталей.",
-        reply_markup=get_main_keyboard()
+        "✅ <b>Заявка принята!</b>\nМы свяжемся с вами!",
+        reply_markup=keyboard
     )
+    await message.answer("Главное меню:", reply_markup=get_main_keyboard())
     await state.clear()
 
-# ==================== ОБРАБОТЧИКИ КУРСОВ И УСЛУГ ====================
+# ==================== ОБРАБОТЧИКИ УСЛУГ ====================
 @dp.message(F.text.in_([f"{data['emoji']} {data['name']}" for data in SERVICES.values()]))
 async def show_service_card(message: Message):
     service_key = None
@@ -386,15 +940,24 @@ async def show_service_card(message: Message):
         return
     
     service = SERVICES[service_key]
+    
+    # Сохраняем действие
+    await db.save_action(
+        message.from_user.id,
+        "view_service",
+        f"Просмотр услуги: {service['name']}"
+    )
+    
     caption = (
         f"{service['emoji']} <b>{service['name']}</b>\n\n"
         f"{service['description']}\n\n"
-        f"💰 <b>Инвестиция в рост:</b> {service['price']}"
+        f"💰 <b>Цена:</b> {service['price']} USD"
     )
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✍️ Забронировать место", callback_data=f"order_{service_key}")],
-        [InlineKeyboardButton(text="💬 Написать консультанту", url="https://t.me/Bizneskonsultant")]
+        [InlineKeyboardButton(text="🌐 Подробнее", url=SITE_URL)],
+        [InlineKeyboardButton(text="✍️ Заказать", callback_data=f"order_{service_key}")],
+        [InlineKeyboardButton(text="🚀 Главный бот", url=MAIN_BOT_URL)]
     ])
     
     await message.answer_photo(
@@ -406,6 +969,7 @@ async def show_service_card(message: Message):
 @dp.callback_query(F.data.startswith("order_"))
 async def order_from_callback(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
+    
     service_key = callback.data.replace("order_", "")
     service = SERVICES.get(service_key)
     
@@ -413,44 +977,103 @@ async def order_from_callback(callback: CallbackQuery, state: FSMContext):
         await callback.message.answer("❌ Услуга не найдена")
         return
     
+    await db.save_action(
+        callback.from_user.id,
+        "order_started",
+        f"Начало заказа: {service['name']}"
+    )
+    
     await state.update_data(service=service['name'])
     await state.set_state(OrderStates.name)
     
     await callback.message.answer(
         f"✅ Вы выбрали: <b>{service['name']}</b>\n"
-        f"💰 Стоимость: {service['price']}\n\n"
-        "Укажите ваше имя:",
+        f"💰 Цена: {service['price']} USD\n\n"
+        "Теперь укажите ваше имя:",
         reply_markup=get_cancel_keyboard()
     )
 
-@dp.message(F.text == "🌐 Наш сайт")
-async def site_link(message: Message):
+@dp.callback_query(F.data == "contact_manager")
+async def contact_manager(callback: CallbackQuery):
+    await callback.answer()
+    
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🌐 Перейти на сайт", url=SITE_URL)]
+        [InlineKeyboardButton(text="🚀 Главный бот", url=MAIN_BOT_URL)]
     ])
-    await message.answer("👉 Посетите наш официальный сайт:", reply_markup=keyboard)
-
-@dp.message(F.text == "💬 Отзывы учеников")
-async def reviews_text(message: Message):
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📱 Читать отзывы и кейсы", url="https://t.me/Biznes_kouching")]
-    ])
-    await message.answer("Все кейсы и отзывы опубликованы в нашем Telegram-канале:", reply_markup=keyboard)
-
-@dp.message(F.text == "❓ FAQ & Ответы")
-async def faq_menu(message: Message):
-    faq_text = (
-        "❓ <b>Часто задаваемые вопросы (FAQ)</b>\n\n"
-        "🔹 <b>Подойдет ли мне коучинг, если я только начинаю?</b>\n"
-        "Да! Для старта отлично подойдет «Экспресс-разбор» или «Курс 2.0».\n\n"
-        "🔹 <b>В каком формате проходят занятия?</b>\n"
-        "Все встречи проходят в Zoom 1-на-1 или в мини-группе. Все записи сохраняются.\n\n"
-        "🔹 <b>Какая гарантия результата?</b>\n"
-        "При полном выполнении всех домашних заданий и рекомендаций вы гарантированно окупаете стоимость программы."
+    await callback.message.answer(
+        "📞 <b>Связаться с менеджером</b>\n\nНапишите нам в главном боте!",
+        reply_markup=keyboard
     )
-    await message.answer(faq_text)
 
-# ==================== ВЕБ-СЕРВЕР И KEEP-ALIVE ====================
+# ==================== АДМИН-КОМАНДЫ ====================
+@dp.message(Command("admin"))
+async def admin_panel(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Доступ запрещен!")
+        return
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Создать пост", callback_data="admin_post")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="📋 Заявки", callback_data="admin_orders")],
+        [InlineKeyboardButton(text="🔔 Тест уведомления", callback_data="admin_test_notify")]
+    ])
+    
+    await message.answer(
+        "🛠 <b>Админ-панель</b>\n\n"
+        f"📢 Канал: {CHANNEL_ID}\n"
+        f"💬 Группа: {GROUP_ID}\n"
+        f"💰 Валюта: USD\n"
+        f"🤖 Главный бот: {MAIN_BOT_URL}\n"
+        f"🌐 Сайт: {SITE_URL}",
+        reply_markup=keyboard
+    )
+
+@dp.callback_query(F.data == "admin_post")
+async def admin_post_callback(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await start_post_creation(callback.message, state)
+
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats(callback: CallbackQuery):
+    await callback.answer()
+    if not is_admin(callback.from_user.id):
+        return
+    
+    await callback.message.answer(
+        "📊 <b>Статистика</b>\n\n"
+        "Данные загружаются из БД..."
+    )
+
+@dp.callback_query(F.data == "admin_orders")
+async def admin_orders(callback: CallbackQuery):
+    await callback.answer()
+    if not is_admin(callback.from_user.id):
+        return
+    
+    await callback.message.answer(
+        "📋 <b>Последние заявки</b>\n\n"
+        "Данные загружаются из БД..."
+    )
+
+@dp.callback_query(F.data == "admin_test_notify")
+async def admin_test_notify(callback: CallbackQuery):
+    await callback.answer()
+    if not is_admin(callback.from_user.id):
+        return
+    
+    success = await notify_admin_about_action(
+        "🧪 Тестовое уведомление",
+        callback.from_user,
+        "Это тестовое сообщение от бота"
+    )
+    
+    if success:
+        await callback.message.answer("✅ Тестовое уведомление отправлено!")
+    else:
+        await callback.message.answer("❌ Ошибка отправки уведомления")
+
+# ==================== ВЕБ-СЕРВЕР ====================
 class WebServer:
     def __init__(self):
         self.app = web.Application()
@@ -462,12 +1085,17 @@ class WebServer:
         self.app.router.add_get("/health", self.handle_health)
 
     async def handle_ping(self, request):
-        return web.Response(text="Bot and Keep-Alive Server are running!", status=200)
+        return web.Response(text="OK", status=200)
 
     async def handle_health(self, request):
         return web.json_response({
             "status": "ok",
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat(),
+            "channel": CHANNEL_ID,
+            "group": GROUP_ID,
+            "currency": "USD",
+            "main_bot": MAIN_BOT_URL,
+            "site": SITE_URL
         })
 
     async def start(self):
@@ -485,28 +1113,20 @@ class WebServer:
 
 web_server = WebServer()
 
-async def keep_alive_task():
-    await asyncio.sleep(10)
-    async with aiohttp.ClientSession() as session:
-        while True:
-            try:
-                if SITE_URL:
-                    async with session.get(SITE_URL) as resp:
-                        logger.info(f"⏰ Keep-alive ping sent to {SITE_URL}, status: {resp.status}")
-            except Exception as e:
-                logger.error(f"❌ Keep-alive error: {e}")
-            await asyncio.sleep(600)
-
 # ==================== ЗАПУСК ====================
 async def main():
     try:
-        logger.info("🚀 Запуск бота бизнес-коучинга...")
+        logger.info("🚀 Запуск бота...")
+        logger.info(f"📢 Канал: {CHANNEL_ID}")
+        logger.info(f"💬 Группа: {GROUP_ID}")
+        logger.info("💰 Валюта: USD")
+        logger.info(f"🤖 Главный бот: {MAIN_BOT_URL}")
+        logger.info(f"🌐 Сайт: {SITE_URL}")
+        logger.info(f"👤 Админ для уведомлений: {ADMIN_USERNAME}")
         
         await db.connect()
         await web_server.start()
         await bot.delete_webhook(drop_pending_updates=True)
-        
-        asyncio.create_task(keep_alive_task())
         
         logger.info("🤖 Бот готов к работе!")
         await dp.start_polling(bot)
@@ -519,4 +1139,4 @@ async def main():
         logger.info("👋 Бот остановлен")
 
 if __name__ == "__main__":
-    async.run(main())
+    asyncio.run(main())
